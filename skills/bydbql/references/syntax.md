@@ -2,8 +2,6 @@
 
 Use this reference to generate one read-only BanyanDB Query Language statement from natural language. Keep dynamic names such as groups, resource names, tags, fields, and sortable fields aligned with live BanyanDB schema discovered through MCP.
 
-Apply this reference only after `references/query-routing.md` selects a BydbQL route. For this skill, SkyWalking trace and profiling requests must stop here and use `references/swctl.md` instead, even though BydbQL itself supports `TRACE`.
-
 ## Core Rules
 
 - Statement forms: `SELECT ... FROM ...` or `SHOW TOP ... FROM MEASURE ...`.
@@ -367,7 +365,7 @@ WITH QUERY_TRACE
 
 Before finalizing a query:
 
-1. Determine the route first: logs/events -> `STREAM`; metrics/statistics -> `MEASURE`; metadata/config/key-value -> `PROPERTY`; ranking over metrics -> `SHOW TOP`; traces/profiling -> `swctl`, not BydbQL.
+1. Select the resource form: logs/events -> `STREAM`; metrics/statistics -> `MEASURE`; trace records/spans -> `TRACE`; metadata/config/key-value -> `PROPERTY`; ranking over metrics -> `SHOW TOP`.
 2. Determine group and resource name. If missing or ambiguous, call `list_groups_schemas`.
 3. Add `TIME` for stream/measure/trace/topn queries.
 4. Add filters from user constraints as `WHERE`.

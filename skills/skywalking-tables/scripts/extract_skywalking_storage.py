@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate SkyWalking BanyanDB storage references from SkyWalking GitHub source."""
+"""Generate SkyWalking BanyanDB storage references from SkyWalking source."""
 
 from __future__ import annotations
 

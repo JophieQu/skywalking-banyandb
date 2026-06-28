@@ -77,8 +77,7 @@ swctl --display json --base-url=http://localhost:12800/graphql process estimate 
 
 Use BanyanDB MCP as supporting discovery when `swctl` cannot resolve an entity name, for example `no such service`,
 or when the user gives an ambiguous label such as "service 1".
-Keep the final trace or profiling query on `swctl`; MCP is only for finding the correct OAP names or IDs.
-When using MCP for this, apply the `skywalking-tables` and `bydbql` skills to avoid inventing storage names.
+When using MCP for this, apply the `skywalking-tables` and `bydbql` skills for storage names, schema context, and raw ID decoding.
 
 Workflow:
 
@@ -87,7 +86,7 @@ Workflow:
 3. Prefer read-only metrics or logs for entity discovery:
    - `sw_metricsMinute`, `sw_metricsHour`, or `sw_metricsDay` measures such as `service_cpm_*`, `service_resp_time_*`, and `service_sla_*`.
    - `sw_recordsLog` stream `log` for `service_id`, `service_instance_id`, `endpoint_id`, `trace_id`, and `content`.
-   - `sw_trace` trace `segment` only to confirm trace storage exists; do not use BydbQL trace queries for final trace retrieval.
+   - `sw_trace` trace `segment` for raw trace storage checks.
 4. Validate each BydbQL statement before execution. Generate one read-only `SELECT` statement with no semicolon.
 5. Decode SkyWalking entity IDs before retrying `swctl`:
    - Service IDs usually look like `<base64(service-name)>.<normal-flag>`, for example `c29uZ3M=.1` means service `songs`.
@@ -307,10 +306,7 @@ swctl --display json --base-url=http://localhost:12800/graphql metrics exec \
   --expression=continuous_profiling_process_cpu
 ```
 
-## Logs and Metrics When Explicitly Requested Through swctl
-
-Use these only when the user explicitly asks for `swctl` or OAP GraphQL output.
-Raw BanyanDB log and metric storage queries belong to the `bydbql` skill, with `skywalking-tables` as schema guidance.
+## Logs and Metrics
 
 ```bash
 # Logs, optionally constrained by tags and trace ID.

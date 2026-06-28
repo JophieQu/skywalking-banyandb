@@ -1,6 +1,6 @@
 # Natural Language Examples
 
-These are BydbQL-route examples only. Do not use these examples for trace or profiling requests. For those, see `references/swctl.md`.
+These examples map natural language to single read-only BydbQL statements.
 
 ```text
 "Query service_cpm_minute in metricsMinute for the last 30 minutes"
@@ -20,6 +20,11 @@ These are BydbQL-route examples only. Do not use these examples for trace or pro
 ```text
 "Show properties for server metadata in datacenter-1"
 => SELECT * FROM PROPERTY server_metadata IN datacenter-1
+```
+
+```text
+"Find recent trace segments for trace ID abc123"
+=> SELECT trace_id, segment_id, service_id FROM TRACE segment IN sw_trace TIME > '-1h' WHERE trace_id = 'abc123' LIMIT 50
 ```
 
 Use `list_groups_schemas` to replace placeholders such as `<stream_name>` or `<group>` before execution.
