@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/apache/skywalking-banyandb/pkg/bydbql/syntax"
+	"github.com/apache/skywalking-banyandb/pkg/bydbql"
 )
 
 type validateRequest struct {
@@ -47,7 +47,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	grammar, parseErr := syntax.ParseQuery(req.Query)
+	grammar, parseErr := bydbql.ParseQuery(req.Query)
 	if parseErr != nil {
 		writeResponse(validateResponse{
 			Valid:      false,
@@ -68,7 +68,7 @@ func main() {
 	})
 }
 
-func queryType(grammar *syntax.Grammar) string {
+func queryType(grammar *bydbql.Grammar) string {
 	if grammar == nil {
 		return ""
 	}
