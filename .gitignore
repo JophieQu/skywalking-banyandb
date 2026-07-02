@@ -57,6 +57,8 @@ tmp
 .env.test.local
 .env.production.local
 .run
+.mcp.json
+.tool-versions
 
 # mock files
 *mock.go
