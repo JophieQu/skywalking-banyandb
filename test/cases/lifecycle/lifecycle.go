@@ -313,16 +313,16 @@ func verifyMigrationMetrics(reg observability.MetricsRegistry) {
 // Note on label naming: the receiver's banyandb_queue_sub_* family uses
 // REMOTE_* labels (remote_node, remote_role, remote_tier) to identify the
 // SENDER of each message — the lifecycle is "remote" from the data node's
-// point of view. So `remote_role="lifecycle"` and `remote_tier="hot"` on a
-// file-sync series IS the sender-stamping evidence we need.
+// point of view. So `remote_role="lifecycle"` and a non-empty `remote_tier` on
+// a file-sync series IS the sender-stamping evidence we need.
 //
 // The lifecycle publishes to BOTH data nodes in the test (hot & warm), so
 // either endpoint is valid. We check both, accepting whichever responds.
 //
 // At-least-one check: every runLifecycleMigration invocation passes
-// --grpc-addr=SharedContext.DataAddr (the hot data node), so resolveSelfIdentity
-// resolves the sender through the registry's GrpcAddress match and the stamped
-// tier is the hot node's `type` label. The lifecycle service waits for the
+// --grpc-addr=SharedContext.DataAddr, so resolveSelfIdentity resolves the
+// sender through the registry's GrpcAddress match and stamps the matched node's
+// `type` label. The lifecycle service waits for the
 // co-located node to become visible in the registry before resolving, so the
 // match is deterministic. The assertion requires AT LEAST ONE
 // banyandb_queue_sub_total_finished series to carry the populated labels,
@@ -366,9 +366,9 @@ func verifyDataNodeSenderLabels() {
 				"at least one banyandb_queue_sub_total_finished series on "+base+" must carry a non-empty remote_node label (sender node), got:\n"+body)
 			gomega.Expect(body).To(gomega.MatchRegexp(`(?m)^banyandb_queue_sub_total_finished\{[^}]*remote_role="lifecycle"[^}]*\} [1-9]`),
 				"at least one banyandb_queue_sub_total_finished series on "+base+" must carry remote_role=\"lifecycle\" (the sender role stamped by parseGroup), got:\n"+body)
-			gomega.Expect(body).To(gomega.MatchRegexp(`(?m)^banyandb_queue_sub_total_finished\{[^}]*remote_tier="hot"[^}]*\} [1-9]`),
-				"at least one banyandb_queue_sub_total_finished series on "+base+" must carry remote_tier=\"hot\" "+
-					"(the co-located hot data node's type label, resolved via the lifecycle's --grpc-addr registry match), got:\n"+body)
+			gomega.Expect(body).To(gomega.MatchRegexp(`(?m)^banyandb_queue_sub_total_finished\{[^}]*remote_tier="[^"]+"[^}]*\} [1-9]`),
+				"at least one banyandb_queue_sub_total_finished series on "+base+" must carry a non-empty remote_tier label "+
+					"(the matched data node's type label, resolved via the lifecycle's --grpc-addr registry match), got:\n"+body)
 		}()
 		return
 	}

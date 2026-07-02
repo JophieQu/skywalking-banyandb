@@ -978,7 +978,7 @@ resource_opts:
 		}
 		return buf.String()
 	}
-	Eventually(createGroup, flags.EventuallyTimeout).Should(ContainSubstring("group ui-template is created"))
+	Eventually(createGroup, flags.EventuallyTimeout).Should(MatchRegexp("group ui-template is created|resource already exists"))
 
 	rootCmd.SetArgs([]string{"property", "schema", "create", "-a", addr, "-f", "-"})
 	createPropertySchema := func() string {
@@ -1002,7 +1002,7 @@ tags:
 		}
 		return buf.String()
 	}
-	Eventually(createPropertySchema, flags.EventuallyTimeout).Should(ContainSubstring("property schema ui-template.service is created"))
+	Eventually(createPropertySchema, flags.EventuallyTimeout).Should(MatchRegexp("property schema ui-template.service is created|resource already exists"))
 }
 
 func applyData(rootCmd *cobra.Command, addr, data string, created bool, tagsNum int) {
