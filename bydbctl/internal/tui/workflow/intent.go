@@ -38,7 +38,9 @@ func ClassifyIntent(querySession *session.QuerySession) agent.QueryHints {
 		return agent.QueryHints{}
 	}
 	hints := agent.QueryHints{
-		UseSlots: strings.TrimSpace(querySession.ResourceName) != "" && len(querySession.Groups) > 0,
+		SlotsPinned: querySession.SlotsPinned,
+		UseSlots:    querySession.SlotsPinned,
+		AutoMatched: querySession.AutoMatched,
 	}
 	goal := strings.TrimSpace(querySession.UserGoal)
 	if topNPattern.MatchString(goal) {

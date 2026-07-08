@@ -39,11 +39,14 @@ func TestSyncSessionUpdatesSlots(t *testing.T) {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
 	updatedSession, syncErr := runner.SyncSession(context.Background(), querySession, StartOptions{
-		ResourceType: session.ResourceTypeStream,
-		ResourceName: "sw",
-		Groups:       []string{"production"},
-		Goal:         "updated goal",
-		TimeRange:    session.TimeRange{Start: "-1h"},
+		ResourceType:   session.ResourceTypeStream,
+		ResourceName:   "sw",
+		Groups:         []string{"production"},
+		Goal:           "updated goal",
+		TimeRange:      session.TimeRange{Start: "-1h"},
+		NameProvided:   true,
+		GroupsProvided: true,
+		TypeProvided:   true,
 	})
 	if syncErr != nil {
 		t.Fatalf("SyncSession returned error: %v", syncErr)
@@ -251,6 +254,42 @@ func TestReviseWithAgentExtractsCandidateFromFragmentedCodexACPOutput(t *testing
 	expected := "SELECT * FROM MEASURE service_endpoint_latency IN default TIME > '-30m' LIMIT 100"
 	if currentCandidate.Query != expected {
 		t.Fatalf("unexpected candidate:\nwant: %s\n got: %s", expected, currentCandidate.Query)
+	}
+}
+
+func TestNormalizeFragmentedAgentTextTimeRange(t *testing.T) {
+	input := "TIME > '- 30 m '"
+	got := normalizeFragmentedAgentText(input)
+	want := "TIME > '-30m'"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestFinalCandidateClaudeACPFragmentedShowTop(t *testing.T) {
+	fragments := []string{
+		"```", "b", "yd", "b", "ql", "text", "SH", "OW", "TOP", "text", "10", "FROM", "ME", "AS", "URE",
+		"service", "_end", "point", "_l", "at", "ency", "IN", "sw", "_", "metrics", "TIME", ">", "'-", "30", "m", "'",
+		"A", "GG", "REG", "ATE", "BY", "SUM", "ORDER", "BY", "DESC", "text", "```",
+	}
+	var events []agent.Event
+	events = append(events, agent.Event{Kind: agent.EventKindPlanUpdate, Message: "available commands updated"})
+	var buffered []string
+	for _, fragment := range fragments {
+		events = append(events, agent.Event{Kind: agent.EventKindMessageDelta, Message: fragment})
+		buffered = append(buffered, fragment)
+	}
+	events = append(events, agent.Event{
+		Kind:    agent.EventKindFinalResponse,
+		Message: strings.Join(buffered, "\n"),
+	})
+	candidate := finalCandidate(events)
+	if candidate == "" {
+		t.Fatal("expected candidate from claude-acp fragmented SHOW TOP output")
+	}
+	expected := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN sw_metrics TIME > '-30m' AGGREGATE BY SUM ORDER BY DESC"
+	if candidate != expected {
+		t.Fatalf("unexpected candidate:\nwant: %s\n got: %s", expected, candidate)
 	}
 }
 

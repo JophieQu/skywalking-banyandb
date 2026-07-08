@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,12 +45,20 @@ const (
 	maxDiagnosticLength = 360
 )
 
+var fragmentedTimeRangePattern = regexp.MustCompile(`'-\s*(\d+)\s*m\s*'`)
+
 var fragmentedTokenReplacements = []struct {
 	old string
 	new string
 }{
 	{old: "by db ql", new: "bydbql"},
+	{old: "b yd b ql", new: "bydbql"},
+	{old: "SH OW", new: "SHOW"},
+	{old: "A GG REG ATE", new: "AGGREGATE"},
+	{old: "TOP text 10", new: "TOP 10"},
+	{old: "TOP text ", new: "TOP "},
 	{old: "ME ASURE", new: "MEASURE"},
+	{old: "ME AS URE", new: "MEASURE"},
 	{old: "ST REAM", new: "STREAM"},
 	{old: "TR ACE", new: "TRACE"},
 	{old: "PROP ERTY", new: "PROPERTY"},
@@ -59,11 +68,10 @@ var fragmentedTokenReplacements = []struct {
 	{old: "OR DER", new: "ORDER"},
 	{old: "WHE RE", new: "WHERE"},
 	{old: "service _", new: "service_"},
+	{old: "service_end point_l atency", new: "service_endpoint_latency"},
 	{old: "endpoint _", new: "endpoint_"},
 	{old: "_ ", new: "_"},
 	{old: " - ", new: "-"},
-	{old: "'- ", new: "'-"},
-	{old: " m '", new: "m'"},
 	{old: "text 10 text", new: "10"},
 	{old: "text 100 text", new: "100"},
 	{old: "text SELECT", new: "SELECT"},
@@ -116,35 +124,53 @@ func NewRunner(config Config) *Runner {
 
 // StartOptions contains user-provided session slots.
 type StartOptions struct {
-	ResourceType session.ResourceType
-	TimeRange    session.TimeRange
-	Goal         string
-	ResourceName string
-	Groups       []string
+	ResourceType   session.ResourceType
+	TimeRange      session.TimeRange
+	Goal           string
+	ResourceName   string
+	Groups         []string
+	NameProvided   bool
+	GroupsProvided bool
+	TypeProvided   bool
 }
 
 // StartSession creates a session and discovers a schema summary.
 func (runner *Runner) StartSession(ctx context.Context, options StartOptions) (*session.QuerySession, error) {
-	normalizedOptions := normalizeOptions(options)
+	catalog, catalogErr := runner.executor.DiscoverCatalog(ctx)
+	if catalogErr != nil {
+		return nil, fmt.Errorf("failed to discover schema catalog: %w", catalogErr)
+	}
+	resolved := ResolveSessionSlots(options, catalog)
 	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
-		Type:   normalizedOptions.ResourceType,
-		Name:   normalizedOptions.ResourceName,
-		Groups: normalizedOptions.Groups,
+		Type:   resolved.ResourceType,
+		Name:   resolved.ResourceName,
+		Groups: resolved.Groups,
 	})
 	if schemaErr != nil {
 		return nil, fmt.Errorf("failed to discover schema: %w", schemaErr)
 	}
+	schemaSnapshot.AvailableGroups = append([]string(nil), catalog.Groups...)
+	schemaSnapshot.Catalog = append([]session.CatalogEntry(nil), catalog.Entries...)
 	querySession := &session.QuerySession{
 		ID:             uuid.NewString(),
 		Phase:          session.PhaseIntent,
-		UserGoal:       normalizedOptions.Goal,
-		ResourceType:   normalizedOptions.ResourceType,
-		ResourceName:   normalizedOptions.ResourceName,
-		Groups:         normalizedOptions.Groups,
-		TimeRange:      normalizedOptions.TimeRange,
+		UserGoal:       resolved.Goal,
+		ResourceType:   resolved.ResourceType,
+		ResourceName:   resolved.ResourceName,
+		Groups:         append([]string(nil), resolved.Groups...),
+		TimeRange:      resolved.TimeRange,
 		SchemaSnapshot: schemaSnapshot,
+		SlotsPinned:    resolved.SlotsPinned,
+		AutoMatched:    resolved.AutoMatched,
 	}
 	querySession.AddTranscript("workflow", "created BYDBQL agent session", runner.now())
+	if resolved.AutoMatched {
+		querySession.AddTranscript(
+			"workflow",
+			fmt.Sprintf("auto-matched resource %s %s in %s from goal", resolved.ResourceType, resolved.ResourceName, strings.Join(resolved.Groups, ",")),
+			runner.now(),
+		)
+	}
 	return querySession, nil
 }
 
@@ -153,42 +179,60 @@ func (runner *Runner) SyncSession(ctx context.Context, querySession *session.Que
 	if querySession == nil {
 		return runner.StartSession(ctx, options)
 	}
-	normalizedOptions := normalizeOptions(options)
-	if !slotsChanged(querySession, normalizedOptions) {
+	if !slotsChanged(querySession, options) {
 		return querySession, nil
 	}
-	querySession.UserGoal = normalizedOptions.Goal
-	querySession.ResourceType = normalizedOptions.ResourceType
-	querySession.ResourceName = normalizedOptions.ResourceName
-	querySession.Groups = normalizedOptions.Groups
-	querySession.TimeRange = normalizedOptions.TimeRange
+	catalog, catalogErr := runner.executor.DiscoverCatalog(ctx)
+	if catalogErr != nil {
+		return nil, fmt.Errorf("failed to discover schema catalog: %w", catalogErr)
+	}
+	resolved := ResolveSessionSlots(options, catalog)
 	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
-		Type:   normalizedOptions.ResourceType,
-		Name:   normalizedOptions.ResourceName,
-		Groups: normalizedOptions.Groups,
+		Type:   resolved.ResourceType,
+		Name:   resolved.ResourceName,
+		Groups: resolved.Groups,
 	})
 	if schemaErr != nil {
 		return nil, fmt.Errorf("failed to refresh schema: %w", schemaErr)
 	}
+	schemaSnapshot.AvailableGroups = append([]string(nil), catalog.Groups...)
+	schemaSnapshot.Catalog = append([]session.CatalogEntry(nil), catalog.Entries...)
+	querySession.UserGoal = resolved.Goal
+	querySession.ResourceType = resolved.ResourceType
+	querySession.ResourceName = resolved.ResourceName
+	querySession.Groups = append([]string(nil), resolved.Groups...)
+	querySession.TimeRange = resolved.TimeRange
 	querySession.SchemaSnapshot = schemaSnapshot
+	querySession.SlotsPinned = resolved.SlotsPinned
+	querySession.AutoMatched = resolved.AutoMatched
 	querySession.AddTranscript("workflow", "refreshed schema after slot change", runner.now())
+	if resolved.AutoMatched {
+		querySession.AddTranscript(
+			"workflow",
+			fmt.Sprintf("auto-matched resource %s %s in %s from goal", resolved.ResourceType, resolved.ResourceName, strings.Join(resolved.Groups, ",")),
+			runner.now(),
+		)
+	}
 	return querySession, nil
 }
 
 func slotsChanged(querySession *session.QuerySession, options StartOptions) bool {
-	if querySession.UserGoal != options.Goal {
+	if querySession.UserGoal != strings.TrimSpace(options.Goal) {
 		return true
 	}
-	if querySession.ResourceType != options.ResourceType {
+	if options.TypeProvided && querySession.ResourceType != options.ResourceType {
 		return true
 	}
-	if querySession.ResourceName != options.ResourceName {
+	if options.NameProvided && querySession.ResourceName != strings.TrimSpace(options.ResourceName) {
 		return true
 	}
-	if querySession.TimeRange.Start != options.TimeRange.Start || querySession.TimeRange.End != options.TimeRange.End {
+	if options.GroupsProvided && !sameGroups(querySession.Groups, normalizeGroupsIfProvided(options.Groups)) {
 		return true
 	}
-	return !sameGroups(querySession.Groups, options.Groups)
+	if querySession.TimeRange.Start != strings.TrimSpace(options.TimeRange.Start) || querySession.TimeRange.End != strings.TrimSpace(options.TimeRange.End) {
+		return true
+	}
+	return false
 }
 
 func sameGroups(left, right []string) bool {
@@ -409,28 +453,6 @@ func (runner *Runner) runAgentTurn(ctx context.Context, agentSessionID string, p
 	return collectedEvents, nil
 }
 
-func normalizeOptions(options StartOptions) StartOptions {
-	resourceType := options.ResourceType
-	if resourceType == "" {
-		resourceType = inferResourceType(options.Goal)
-	}
-	resourceName := strings.TrimSpace(options.ResourceName)
-	if resourceName == "" {
-		resourceName = defaultResourceName
-	}
-	timeRange := options.TimeRange
-	if strings.TrimSpace(timeRange.Start) == "" {
-		timeRange.Start = defaultTimeStart
-	}
-	return StartOptions{
-		ResourceType: resourceType,
-		TimeRange:    timeRange,
-		Goal:         strings.TrimSpace(options.Goal),
-		ResourceName: resourceName,
-		Groups:       normalizeGroups(options.Groups),
-	}
-}
-
 func inferResourceType(goal string) session.ResourceType {
 	normalizedGoal := strings.ToLower(goal)
 	switch {
@@ -487,6 +509,9 @@ func finalCandidate(events []agent.Event) string {
 	}
 	var messages []string
 	for _, event := range events {
+		if event.Kind == agent.EventKindPlanUpdate {
+			continue
+		}
 		if strings.TrimSpace(event.Message) != "" {
 			messages = append(messages, event.Message)
 		}
@@ -494,10 +519,29 @@ func finalCandidate(events []agent.Event) string {
 	if candidate := extractCandidateFromText(strings.Join(messages, "\n")); candidate != "" {
 		return candidate
 	}
-	if candidate := extractCandidateFromFragmentedText(strings.Join(messages, "\n")); candidate != "" {
+	if candidate := extractCandidateFromFragmentedText(agentOutputText(events)); candidate != "" {
 		return candidate
 	}
 	return ""
+}
+
+func agentOutputText(events []agent.Event) string {
+	for eventIdx := len(events) - 1; eventIdx >= 0; eventIdx-- {
+		event := events[eventIdx]
+		if event.Kind == agent.EventKindFinalResponse && strings.TrimSpace(event.Message) != "" {
+			return event.Message
+		}
+	}
+	var messages []string
+	for _, event := range events {
+		if event.Kind == agent.EventKindPlanUpdate {
+			continue
+		}
+		if strings.TrimSpace(event.Message) != "" {
+			messages = append(messages, event.Message)
+		}
+	}
+	return strings.Join(messages, "\n")
 }
 
 func finalExplanation(events []agent.Event) string {
@@ -565,17 +609,19 @@ func extractCandidateFromFragmentedText(text string) string {
 
 func normalizeFragmentedAgentText(text string) string {
 	normalizedText := singleLine(text)
-	for _, replacement := range fragmentedTokenReplacements {
-		normalizedText = strings.ReplaceAll(normalizedText, replacement.old, replacement.new)
-	}
 	normalizedText = strings.ReplaceAll(normalizedText, "` ` `", "```")
 	normalizedText = strings.ReplaceAll(normalizedText, "`` `", "```")
 	normalizedText = strings.ReplaceAll(normalizedText, "` ``", "```")
+	normalizedText = collapseIdentifierFragments(normalizedText)
+	for _, replacement := range fragmentedTokenReplacements {
+		normalizedText = strings.ReplaceAll(normalizedText, replacement.old, replacement.new)
+	}
 	normalizedText = strings.ReplaceAll(normalizedText, " ,", ",")
 	normalizedText = strings.ReplaceAll(normalizedText, " .", ".")
 	normalizedText = strings.ReplaceAll(normalizedText, "( ", "(")
 	normalizedText = strings.ReplaceAll(normalizedText, " )", ")")
-	normalizedText = collapseIdentifierFragments(normalizedText)
+	normalizedText = strings.ReplaceAll(normalizedText, " text ", " ")
+	normalizedText = fragmentedTimeRangePattern.ReplaceAllString(normalizedText, "'-${1}m'")
 	normalizedText = strings.ReplaceAll(normalizedText, ">'", "> '")
 	normalizedText = strings.ReplaceAll(normalizedText, "<'", "< '")
 	return strings.TrimSpace(normalizedText)
@@ -604,9 +650,6 @@ func shouldJoinIdentifierFragment(left, right string) bool {
 		return false
 	}
 	if strings.HasSuffix(left, "_") || strings.HasPrefix(right, "_") {
-		return true
-	}
-	if strings.HasPrefix(left, "'") || strings.HasSuffix(right, "'") {
 		return true
 	}
 	return isLowerAlpha(left) && isLowerAlpha(right) && len(left) <= 4 && len(right) <= 12

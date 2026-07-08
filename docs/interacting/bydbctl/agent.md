@@ -127,7 +127,21 @@ End:
 
 The TUI sends the goal, slots, schema summary (including indexed fields for ORDER BY), time range, query hints, a template baseline query, current BYDBQL candidate, validation errors, and execution errors to the configured agent. The agent returns a BYDBQL candidate. The candidate is written into the `BYDBQL Candidate` editor.
 
-With `--addr` set, bydbctl discovers schema, index rules, and available resource names in the group directly from BanyanDB HTTP APIs. Changing TUI slots (type, name, groups, time range, or goal) refreshes schema automatically before the next workflow action. MCP is optional and not required for standalone use.
+With `--addr` set, bydbctl discovers groups, resource catalogs, schema details, and index rules directly from BanyanDB HTTP APIs before each workflow action. If you only provide a goal, bydbctl auto-matches the best resource from `schema.catalog` and fills the Slots for you. Explicit Name and Groups values pin the slots and override catalog matching. MCP is optional and not required for standalone use.
+
+Goal-only example:
+
+```shell
+bydbctl agent \
+  --agent acp \
+  --acp-command npx \
+  --acp-arg -y \
+  --acp-arg @agentclientprotocol/claude-agent-acp \
+  --addr http://localhost:17913 \
+  --goal "top 10 slow payment endpoints in last 30 minutes"
+```
+
+bydbctl lists groups from `/api/v1/group/schema/lists`, lists resources per group, scores catalog entries against the goal, and sends the matched schema plus full catalog to the agent.
 
 ## Edit, Validate, Execute, and Accept
 

@@ -83,14 +83,30 @@ type TimeRange struct {
 
 // SchemaSnapshot is the schema summary passed across the agent boundary.
 type SchemaSnapshot struct {
-	UpdatedAt     time.Time
-	Type          ResourceType
-	Name          string
-	Groups        []string
-	Tags          []string
-	Fields        []string
-	IndexedFields []string
-	ResourceNames []string
+	UpdatedAt       time.Time
+	Type            ResourceType
+	Name            string
+	Groups          []string
+	Tags            []string
+	Fields          []string
+	IndexedFields   []string
+	ResourceNames   []string
+	AvailableGroups []string
+	Catalog         []CatalogEntry
+}
+
+// CatalogEntry is one discoverable BanyanDB resource in a group.
+type CatalogEntry struct {
+	Group string
+	Type  ResourceType
+	Name  string
+}
+
+// SchemaCatalog is the full read-only resource catalog discovered from BanyanDB.
+type SchemaCatalog struct {
+	UpdatedAt time.Time
+	Groups    []string
+	Entries   []CatalogEntry
 }
 
 // CandidateSource records where a BYDBQL candidate came from.
@@ -161,6 +177,8 @@ type QuerySession struct {
 	Groups          []string
 	TimeRange       TimeRange
 	SchemaSnapshot  SchemaSnapshot
+	SlotsPinned     bool
+	AutoMatched     bool
 	Candidates      []BydbqlCandidate
 	Validation      ValidationReport
 	ExecutionResult ExecutionResult

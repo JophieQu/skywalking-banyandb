@@ -670,13 +670,9 @@ func toolMessage(update map[string]any) string {
 }
 
 func contentText(content map[string]any) string {
-	text := stringValue(content, "text")
+	text := stringValue(content, "text", "value", "delta", "content")
 	if text != "" {
 		return text
-	}
-	contentType := strings.ToLower(stringValue(content, "type"))
-	if contentType != "" {
-		return contentType
 	}
 	return ""
 }

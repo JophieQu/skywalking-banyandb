@@ -102,7 +102,8 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 	prompt.WriteString("- Use only the schema summary, slots, query_hints, and template_hint from the context JSON.\n")
 	prompt.WriteString("- Do not call external tools, shell commands, or MCP servers.\n")
 	prompt.WriteString("- Keep the query read-only. Never generate create, update, delete, drop, or apply operations.\n")
-	prompt.WriteString("- Use FROM <resource_type> <resource_name> IN <groups> from the context when slots are provided.\n")
+	prompt.WriteString("- When query_hints.slots_pinned=true, use schema.type, schema.name, and schema.groups exactly.\n")
+	prompt.WriteString("- When query_hints.slots_pinned=false and schema.catalog is present, choose the best matching catalog entry for the goal.\n")
 	prompt.WriteString("- For MEASURE, STREAM, TRACE, and SHOW TOP, include a TIME clause from time_range in the context.\n")
 	if initial {
 		prompt.WriteString("- For exploratory SELECT queries, include LIMIT 10 unless query_hints specify otherwise.\n")
@@ -114,11 +115,13 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 
 func writeNLRules(prompt *bytes.Buffer) {
 	prompt.WriteString("Natural language rules:\n")
-	prompt.WriteString("- Slots (type, name, groups, time_range) override names inferred from the goal.\n")
+	prompt.WriteString("- When slots_pinned=true, schema slots override names inferred from the goal.\n")
+	prompt.WriteString("- When slots_pinned=false, prefer schema.catalog and schema.available_groups to infer type, name, and group.\n")
 	prompt.WriteString("- query_hints.prefer_show_top=true means use SHOW TOP, not SELECT with LIMIT.\n")
 	prompt.WriteString("- Distinguish time ranges (TIME clause) from data-point limits (LIMIT clause).\n")
 	prompt.WriteString("- template_hint shows a valid baseline query for the current slots; adapt it to the goal.\n")
-	prompt.WriteString("- schema.available_resources lists resource names in the current group when the name slot may be wrong.\n\n")
+	prompt.WriteString("- schema.available_resources lists resource names in the current group when the name slot may be wrong.\n")
+	prompt.WriteString("- schema.catalog lists discoverable resources across groups when the user only provided a goal.\n\n")
 }
 
 func writeReferences(prompt *bytes.Buffer) {

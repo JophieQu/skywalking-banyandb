@@ -62,9 +62,12 @@ type Config struct {
 	ResourceType string
 	ResourceName string
 	Groups       string
-	Start        string
-	End          string
-	MaxRetries   int
+	Start           string
+	End             string
+	MaxRetries      int
+	NameProvided    bool
+	GroupsProvided  bool
+	TypeProvided    bool
 }
 
 // Model is the Bubble Tea state for the bydbctl agent TUI.
@@ -85,8 +88,9 @@ type Model struct {
 	logPathDisplay string
 	width          int
 	height       int
-	focus        int
-	busy         bool
+	focus          int
+	busy           bool
+	typePinned     bool
 }
 
 // NewModel creates a TUI model with the configured agent gateway.
@@ -138,6 +142,7 @@ func NewModel(config Config) Model {
 		logPathDisplay: applog.DisplayPath(sessionLogPath(sessionLog)),
 		width:          defaultWidth,
 		height:         defaultHeight,
+		typePinned:     config.TypeProvided,
 	}
 	if sessionLog != nil {
 		sessionLog.Write("session", fmt.Sprintf("provider=%s addr=workflow", provider))
@@ -170,6 +175,11 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			m.querySession = typedMsg.querySession
 			if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil {
 				m.query.SetValue(currentCandidate.Query)
+			}
+			if m.querySession.AutoMatched {
+				m.resourceName.SetValue(m.querySession.ResourceName)
+				m.groups.SetValue(strings.Join(m.querySession.Groups, ","))
+				m.resourceType = m.querySession.ResourceType
 			}
 		}
 		m.addAgentEvents(typedMsg.events)
@@ -254,6 +264,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		return m.syncFocus(), true
 	case "ctrl+r":
 		m.resourceType = nextResourceType(m.resourceType)
+		m.typePinned = true
 		return nil, true
 	case "ctrl+a":
 		if m.busy {
@@ -460,9 +471,12 @@ func (m Model) startOptions() workflow.StartOptions {
 			Start: m.start.Value(),
 			End:   m.end.Value(),
 		},
-		Goal:         m.goal.Value(),
-		ResourceName: m.resourceName.Value(),
-		Groups:       []string{m.groups.Value()},
+		Goal:           m.goal.Value(),
+		ResourceName:   m.resourceName.Value(),
+		Groups:         []string{m.groups.Value()},
+		NameProvided:   strings.TrimSpace(m.resourceName.Value()) != "",
+		GroupsProvided: strings.TrimSpace(m.groups.Value()) != "",
+		TypeProvided:   m.typePinned,
 	}
 }
 

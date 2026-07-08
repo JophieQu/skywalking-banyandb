@@ -34,6 +34,7 @@ type SchemaRequest struct {
 
 // Executor is the read-only tool boundary owned by WorkflowRunner.
 type Executor interface {
+	DiscoverCatalog(ctx context.Context) (session.SchemaCatalog, error)
 	DiscoverSchema(ctx context.Context, req SchemaRequest) (session.SchemaSnapshot, error)
 	Execute(ctx context.Context, querySession *session.QuerySession, query string) (session.ExecutionResult, error)
 }
@@ -48,6 +49,11 @@ func NewReadOnlyExecutor() *ReadOnlyExecutor {
 	return &ReadOnlyExecutor{
 		now: time.Now,
 	}
+}
+
+// DiscoverCatalog returns an empty catalog for the local placeholder executor.
+func (executor *ReadOnlyExecutor) DiscoverCatalog(_ context.Context) (session.SchemaCatalog, error) {
+	return session.SchemaCatalog{UpdatedAt: executor.now()}, nil
 }
 
 // DiscoverSchema returns the schema request as a snapshot placeholder.

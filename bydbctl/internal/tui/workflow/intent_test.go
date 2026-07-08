@@ -29,6 +29,7 @@ func TestClassifyIntentPreferShowTop(t *testing.T) {
 		ResourceName: "service_latency",
 		Groups:       []string{"production"},
 		TimeRange:    session.TimeRange{Start: "-30m"},
+		SlotsPinned:  true,
 	})
 	if !hints.PreferShowTop {
 		t.Fatal("expected prefer_show_top")

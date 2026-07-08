@@ -36,6 +36,7 @@ import (
 
 const (
 	defaultHTTPTimeout = 3 * time.Second
+	groupListPath      = "/api/v1/group/schema/lists"
 	measureSchemaPath  = "/api/v1/measure/schema/{group}/{name}"
 	streamSchemaPath   = "/api/v1/stream/schema/{group}/{name}"
 	traceSchemaPath    = "/api/v1/trace/schema/{group}/{name}"
@@ -84,6 +85,79 @@ func NewHTTPExecutor(config HTTPConfig) *HTTPExecutor {
 		},
 		now: time.Now,
 	}
+}
+
+const maxCatalogEntries = 400
+
+// DiscoverCatalog lists groups and resource names across supported resource types.
+func (executor *HTTPExecutor) DiscoverCatalog(ctx context.Context) (session.SchemaCatalog, error) {
+	catalog := session.SchemaCatalog{UpdatedAt: executor.now()}
+	if executor.config.Addr == "" {
+		return catalog, nil
+	}
+	groups, groupsErr := executor.listGroups(ctx)
+	if groupsErr != nil {
+		return catalog, groupsErr
+	}
+	catalog.Groups = groups
+	for _, group := range groups {
+		for _, resourceType := range catalogResourceTypes() {
+			resourceNames, listErr := executor.listResources(ctx, group, resourceType)
+			if listErr != nil {
+				continue
+			}
+			for _, resourceName := range resourceNames {
+				catalog.Entries = append(catalog.Entries, session.CatalogEntry{
+					Group: group,
+					Type:  resourceType,
+					Name:  resourceName,
+				})
+				if len(catalog.Entries) >= maxCatalogEntries {
+					return catalog, nil
+				}
+			}
+		}
+	}
+	return catalog, nil
+}
+
+func catalogResourceTypes() []session.ResourceType {
+	return []session.ResourceType{
+		session.ResourceTypeMeasure,
+		session.ResourceTypeStream,
+		session.ResourceTypeTrace,
+		session.ResourceTypeProperty,
+		session.ResourceTypeTopN,
+	}
+}
+
+func (executor *HTTPExecutor) listGroups(ctx context.Context) ([]string, error) {
+	request := executor.client.R().
+		SetContext(ctx).
+		SetHeader("Accept", "application/json")
+	if authHeader := executor.authHeader(); authHeader != "" {
+		request.SetHeader("Authorization", authHeader)
+	}
+	response, requestErr := request.Get(executor.config.Addr + groupListPath)
+	if requestErr != nil || response.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("group list unavailable")
+	}
+	listResponse := new(databasev1.GroupRegistryServiceListResponse)
+	if unmarshalErr := protojson.Unmarshal(response.Body(), listResponse); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	return metadataNames(extractGroupMetadata(listResponse.GetGroup())), nil
+}
+
+func extractGroupMetadata(groups []*commonv1.Group) []*commonv1.Metadata {
+	metadataItems := make([]*commonv1.Metadata, 0, len(groups))
+	for _, group := range groups {
+		if group == nil || group.GetMetadata() == nil {
+			continue
+		}
+		metadataItems = append(metadataItems, group.GetMetadata())
+	}
+	return metadataItems
 }
 
 // DiscoverSchema fetches and summarizes a resource schema, falling back to a local snapshot when unavailable.

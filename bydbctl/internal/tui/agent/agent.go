@@ -93,13 +93,15 @@ type Constraints struct {
 
 // SchemaSummary is the schema subset exposed to an agent.
 type SchemaSummary struct {
-	Groups            []string `json:"groups"`
-	Tags              []string `json:"tags"`
-	Fields            []string `json:"fields"`
-	IndexedFields     []string `json:"indexed_fields,omitempty"`
-	AvailableResources []string `json:"available_resources,omitempty"`
-	Type              string   `json:"type"`
-	Name              string   `json:"name"`
+	Groups             []string              `json:"groups"`
+	Tags               []string              `json:"tags"`
+	Fields             []string              `json:"fields"`
+	IndexedFields      []string              `json:"indexed_fields,omitempty"`
+	AvailableResources []string              `json:"available_resources,omitempty"`
+	AvailableGroups    []string              `json:"available_groups,omitempty"`
+	Catalog            []CatalogEntrySummary `json:"catalog,omitempty"`
+	Type               string                `json:"type"`
+	Name               string                `json:"name"`
 }
 
 // TimeRangePayload is the BYDBQL-compatible time range from TUI slots.
@@ -113,7 +115,16 @@ type QueryHints struct {
 	PreferShowTop bool   `json:"prefer_show_top,omitempty"`
 	TimeRangeHint string `json:"time_range_hint,omitempty"`
 	LimitHint     int    `json:"limit_hint,omitempty"`
+	SlotsPinned   bool   `json:"slots_pinned"`
+	AutoMatched   bool   `json:"auto_matched,omitempty"`
 	UseSlots      bool   `json:"use_slots"`
+}
+
+// CatalogEntrySummary is one discoverable resource exposed to the agent.
+type CatalogEntrySummary struct {
+	Group string `json:"group"`
+	Type  string `json:"type"`
+	Name  string `json:"name"`
 }
 
 // ExecutionSummary is the compact execution feedback exposed to the agent.
@@ -218,6 +229,8 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 			Fields:             append([]string(nil), querySession.SchemaSnapshot.Fields...),
 			IndexedFields:      append([]string(nil), querySession.SchemaSnapshot.IndexedFields...),
 			AvailableResources: append([]string(nil), querySession.SchemaSnapshot.ResourceNames...),
+			AvailableGroups:    append([]string(nil), querySession.SchemaSnapshot.AvailableGroups...),
+			Catalog:            catalogSummary(querySession.SchemaSnapshot.Catalog),
 		},
 		ExecutionSummary: executionSummary,
 		ValidationError:  validationError,
@@ -231,4 +244,19 @@ func MarshalPayload(payload RequestPayload) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func catalogSummary(entries []session.CatalogEntry) []CatalogEntrySummary {
+	if len(entries) == 0 {
+		return nil
+	}
+	summary := make([]CatalogEntrySummary, 0, len(entries))
+	for _, entry := range entries {
+		summary = append(summary, CatalogEntrySummary{
+			Group: entry.Group,
+			Type:  entry.Type.String(),
+			Name:  entry.Name,
+		})
+	}
+	return summary
 }

@@ -205,6 +205,55 @@ func TestHTTPExecutorExecuteBydbQL(t *testing.T) {
 	}
 }
 
+func TestHTTPExecutorDiscoverCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/api/v1/group/schema/lists":
+			listResponse := &databasev1.GroupRegistryServiceListResponse{
+				Group: []*commonv1.Group{
+					{Metadata: &commonv1.Metadata{Name: "sw_metrics"}},
+				},
+			}
+			body, marshalErr := protojson.Marshal(listResponse)
+			if marshalErr != nil {
+				t.Fatalf("failed to marshal groups: %v", marshalErr)
+			}
+			_, _ = writer.Write(body)
+		case request.URL.Path == "/api/v1/measure/schema/lists/sw_metrics":
+			listResponse := &databasev1.MeasureRegistryServiceListResponse{
+				Measure: []*databasev1.Measure{
+					{Metadata: &commonv1.Metadata{Name: "service_endpoint_latency", Group: "sw_metrics"}},
+				},
+			}
+			body, marshalErr := protojson.Marshal(listResponse)
+			if marshalErr != nil {
+				t.Fatalf("failed to marshal measures: %v", marshalErr)
+			}
+			_, _ = writer.Write(body)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	executor := NewHTTPExecutor(HTTPConfig{Addr: server.URL})
+	catalog, discoverErr := executor.DiscoverCatalog(context.Background())
+	if discoverErr != nil {
+		t.Fatalf("DiscoverCatalog returned error: %v", discoverErr)
+	}
+	if len(catalog.Groups) != 1 || catalog.Groups[0] != "sw_metrics" {
+		t.Fatalf("unexpected groups: %+v", catalog.Groups)
+	}
+	found := false
+	for _, entry := range catalog.Entries {
+		if entry.Group == "sw_metrics" && entry.Name == "service_endpoint_latency" && entry.Type == session.ResourceTypeMeasure {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected measure catalog entry, got %+v", catalog.Entries)
+	}
+}
+
 func readRequestBody(t *testing.T, request *http.Request) []byte {
 	t.Helper()
 	body, readErr := io.ReadAll(request.Body)
