@@ -19,15 +19,24 @@ package app
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 )
 
 func TestUpdateSyncsSessionAndEventsBeforeError(t *testing.T) {
-	model := NewModel(Config{})
+	sessionLog, createErr := applog.New(t.TempDir())
+	if createErr != nil {
+		t.Fatalf("failed to create session log: %v", createErr)
+	}
+	defer func() {
+		_ = sessionLog.Close()
+	}()
+	model := NewModel(Config{SessionLog: sessionLog})
 	querySession := &session.QuerySession{}
 	querySession.AddCandidate(session.BydbqlCandidate{
 		Query:  "SELECT * FROM STREAM sw IN default WHERE",
@@ -55,9 +64,22 @@ func TestUpdateSyncsSessionAndEventsBeforeError(t *testing.T) {
 		t.Fatalf("unexpected query value: %s", typedModel.query.Value())
 	}
 	events := strings.Join(typedModel.events, "\n")
-	for _, expected := range []string{"agent raw output", "syntax error", "invalid candidate", "agent candidate failed validation"} {
+	for _, expected := range []string{"validation:", "invalid candidate", "error: agent candidate failed validation"} {
 		if !strings.Contains(events, expected) {
-			t.Fatalf("expected event %q in:\n%s", expected, events)
+			t.Fatalf("expected compact event %q in:\n%s", expected, events)
+		}
+	}
+	if strings.Contains(events, "agent raw output") {
+		t.Fatalf("message delta should not appear in compact events:\n%s", events)
+	}
+	logBytes, readErr := os.ReadFile(sessionLog.Path())
+	if readErr != nil {
+		t.Fatalf("failed to read session log: %v", readErr)
+	}
+	logContent := string(logBytes)
+	for _, expected := range []string{"agent raw output", "syntax error: expected expression", "agent candidate failed validation"} {
+		if !strings.Contains(logContent, expected) {
+			t.Fatalf("expected log to contain %q:\n%s", expected, logContent)
 		}
 	}
 }

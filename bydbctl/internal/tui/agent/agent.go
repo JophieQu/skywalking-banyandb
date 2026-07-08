@@ -93,12 +93,13 @@ type Constraints struct {
 
 // SchemaSummary is the schema subset exposed to an agent.
 type SchemaSummary struct {
-	Groups        []string `json:"groups"`
-	Tags          []string `json:"tags"`
-	Fields        []string `json:"fields"`
-	IndexedFields []string `json:"indexed_fields,omitempty"`
-	Type          string   `json:"type"`
-	Name          string   `json:"name"`
+	Groups            []string `json:"groups"`
+	Tags              []string `json:"tags"`
+	Fields            []string `json:"fields"`
+	IndexedFields     []string `json:"indexed_fields,omitempty"`
+	AvailableResources []string `json:"available_resources,omitempty"`
+	Type              string   `json:"type"`
+	Name              string   `json:"name"`
 }
 
 // TimeRangePayload is the BYDBQL-compatible time range from TUI slots.
@@ -123,6 +124,7 @@ type ExecutionSummary struct {
 	Command string `json:"command"`
 	Path    string `json:"path"`
 	Error   string `json:"error,omitempty"`
+	Hint    string `json:"hint,omitempty"`
 }
 
 // BuildBydbqlPrompt renders the provider prompt for BYDBQL generation.
@@ -180,7 +182,7 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 		validationError = &message
 	}
 	var executionSummary *ExecutionSummary
-	if querySession.ExecutionResult.Summary != "" || querySession.ExecutionResult.Error != "" {
+	if querySession.ExecutionResult.Summary != "" || querySession.ExecutionResult.Error != "" || querySession.ExecutionResult.Hint != "" {
 		executionSummary = &ExecutionSummary{
 			Rows:    querySession.ExecutionResult.Rows,
 			Summary: querySession.ExecutionResult.Summary,
@@ -188,6 +190,7 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 			Command: querySession.ExecutionResult.Command,
 			Path:    querySession.ExecutionResult.Path,
 			Error:   querySession.ExecutionResult.Error,
+			Hint:    querySession.ExecutionResult.Hint,
 		}
 	}
 	return RequestPayload{
@@ -208,12 +211,13 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 			MustNotExecuteTools:                true,
 		},
 		Schema: SchemaSummary{
-			Type:          querySession.SchemaSnapshot.Type.String(),
-			Name:          querySession.SchemaSnapshot.Name,
-			Groups:        append([]string(nil), querySession.SchemaSnapshot.Groups...),
-			Tags:          append([]string(nil), querySession.SchemaSnapshot.Tags...),
-			Fields:        append([]string(nil), querySession.SchemaSnapshot.Fields...),
-			IndexedFields: append([]string(nil), querySession.SchemaSnapshot.IndexedFields...),
+			Type:               querySession.SchemaSnapshot.Type.String(),
+			Name:               querySession.SchemaSnapshot.Name,
+			Groups:             append([]string(nil), querySession.SchemaSnapshot.Groups...),
+			Tags:               append([]string(nil), querySession.SchemaSnapshot.Tags...),
+			Fields:             append([]string(nil), querySession.SchemaSnapshot.Fields...),
+			IndexedFields:      append([]string(nil), querySession.SchemaSnapshot.IndexedFields...),
+			AvailableResources: append([]string(nil), querySession.SchemaSnapshot.ResourceNames...),
 		},
 		ExecutionSummary: executionSummary,
 		ValidationError:  validationError,

@@ -148,6 +148,61 @@ func (runner *Runner) StartSession(ctx context.Context, options StartOptions) (*
 	return querySession, nil
 }
 
+// SyncSession updates session slots and refreshes schema when the TUI inputs change.
+func (runner *Runner) SyncSession(ctx context.Context, querySession *session.QuerySession, options StartOptions) (*session.QuerySession, error) {
+	if querySession == nil {
+		return runner.StartSession(ctx, options)
+	}
+	normalizedOptions := normalizeOptions(options)
+	if !slotsChanged(querySession, normalizedOptions) {
+		return querySession, nil
+	}
+	querySession.UserGoal = normalizedOptions.Goal
+	querySession.ResourceType = normalizedOptions.ResourceType
+	querySession.ResourceName = normalizedOptions.ResourceName
+	querySession.Groups = normalizedOptions.Groups
+	querySession.TimeRange = normalizedOptions.TimeRange
+	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
+		Type:   normalizedOptions.ResourceType,
+		Name:   normalizedOptions.ResourceName,
+		Groups: normalizedOptions.Groups,
+	})
+	if schemaErr != nil {
+		return nil, fmt.Errorf("failed to refresh schema: %w", schemaErr)
+	}
+	querySession.SchemaSnapshot = schemaSnapshot
+	querySession.AddTranscript("workflow", "refreshed schema after slot change", runner.now())
+	return querySession, nil
+}
+
+func slotsChanged(querySession *session.QuerySession, options StartOptions) bool {
+	if querySession.UserGoal != options.Goal {
+		return true
+	}
+	if querySession.ResourceType != options.ResourceType {
+		return true
+	}
+	if querySession.ResourceName != options.ResourceName {
+		return true
+	}
+	if querySession.TimeRange.Start != options.TimeRange.Start || querySession.TimeRange.End != options.TimeRange.End {
+		return true
+	}
+	return !sameGroups(querySession.Groups, options.Groups)
+}
+
+func sameGroups(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for idx := range left {
+		if left[idx] != right[idx] {
+			return false
+		}
+	}
+	return true
+}
+
 // ReviseWithAgent asks the configured agent to revise the current BYDBQL candidate.
 func (runner *Runner) ReviseWithAgent(ctx context.Context, querySession *session.QuerySession) ([]agent.Event, error) {
 	if querySession == nil {
@@ -279,6 +334,9 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 	}
 	querySession.ExecutionResult = executionResult
 	querySession.Phase = session.PhaseExecuted
+	if executionResult.Hint != "" {
+		querySession.AddTranscript("workflow", executionResult.Hint, runner.now())
+	}
 	querySession.AddTranscript("workflow", executionResult.Summary, runner.now())
 	return nil
 }

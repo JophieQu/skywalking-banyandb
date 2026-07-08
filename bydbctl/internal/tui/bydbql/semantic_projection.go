@@ -1,0 +1,126 @@
+// Licensed to Apache Software Foundation (ASF) under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Apache Software Foundation (ASF) licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package bydbql
+
+import (
+	"fmt"
+	"strings"
+
+	corebydbql "github.com/apache/skywalking-banyandb/pkg/bydbql"
+
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
+)
+
+func validateSchemaIdentifiers(query string, schema *session.SchemaSnapshot) string {
+	if schema == nil || (len(schema.Tags) == 0 && len(schema.Fields) == 0) {
+		return ""
+	}
+	grammar, parseErr := corebydbql.ParseQuery(query)
+	if parseErr != nil || grammar == nil || grammar.Select == nil {
+		return ""
+	}
+	knownIdentifiers := buildKnownIdentifiers(schema)
+	for _, identifier := range selectIdentifiers(grammar.Select) {
+		if !knownIdentifiers[strings.ToLower(identifier)] {
+			return fmt.Sprintf("identifier %q is not in schema tags or fields: %s", identifier, strings.Join(schemaIdentifierList(schema), ", "))
+		}
+	}
+	for _, identifier := range groupByIdentifiers(grammar.Select) {
+		if !knownIdentifiers[strings.ToLower(identifier)] {
+			return fmt.Sprintf("GROUP BY identifier %q is not in schema tags: %s", identifier, strings.Join(schema.Tags, ", "))
+		}
+	}
+	return ""
+}
+
+func buildKnownIdentifiers(schema *session.SchemaSnapshot) map[string]bool {
+	knownIdentifiers := make(map[string]bool, len(schema.Tags)+len(schema.Fields))
+	for _, tagName := range schema.Tags {
+		knownIdentifiers[strings.ToLower(strings.TrimSpace(tagName))] = true
+	}
+	for _, fieldName := range schema.Fields {
+		knownIdentifiers[strings.ToLower(strings.TrimSpace(fieldName))] = true
+	}
+	return knownIdentifiers
+}
+
+func schemaIdentifierList(schema *session.SchemaSnapshot) []string {
+	return compactIdentifierList(append(append([]string(nil), schema.Tags...), schema.Fields...))
+}
+
+func compactIdentifierList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	var compacted []string
+	for _, value := range values {
+		trimmedValue := strings.TrimSpace(value)
+		if trimmedValue == "" {
+			continue
+		}
+		lowerValue := strings.ToLower(trimmedValue)
+		if _, ok := seen[lowerValue]; ok {
+			continue
+		}
+		seen[lowerValue] = struct{}{}
+		compacted = append(compacted, trimmedValue)
+	}
+	return compacted
+}
+
+func selectIdentifiers(selectStmt *corebydbql.GrammarSelectStatement) []string {
+	if selectStmt == nil || selectStmt.Projection == nil {
+		return nil
+	}
+	projection := selectStmt.Projection
+	if projection.All || projection.Empty || projection.TopN != nil {
+		return nil
+	}
+	var identifiers []string
+	for _, column := range projection.Columns {
+		if column == nil {
+			continue
+		}
+		if column.Aggregate != nil && column.Aggregate.Column != nil {
+			if identifier, identifierErr := column.Aggregate.Column.ToString(false); identifierErr == nil {
+				identifiers = append(identifiers, identifier)
+			}
+			continue
+		}
+		if column.Identifier != nil {
+			if identifier, identifierErr := column.Identifier.ToString(column.TypeSpec != nil); identifierErr == nil {
+				identifiers = append(identifiers, identifier)
+			}
+		}
+	}
+	return identifiers
+}
+
+func groupByIdentifiers(selectStmt *corebydbql.GrammarSelectStatement) []string {
+	if selectStmt == nil || selectStmt.GroupBy == nil {
+		return nil
+	}
+	var identifiers []string
+	for _, column := range selectStmt.GroupBy.Columns {
+		if column == nil || column.Identifier == nil {
+			continue
+		}
+		if identifier, identifierErr := column.Identifier.ToString(column.TypeSpec != nil); identifierErr == nil {
+			identifiers = append(identifiers, identifier)
+		}
+	}
+	return identifiers
+}

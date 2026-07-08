@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	bydbqlv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/bydbql/v1"
+	commonv1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/common/v1"
 	databasev1 "github.com/apache/skywalking-banyandb/api/proto/banyandb/database/v1"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/pkg/auth"
@@ -40,6 +41,11 @@ const (
 	traceSchemaPath    = "/api/v1/trace/schema/{group}/{name}"
 	propertySchemaPath = "/api/v1/property/schema/{group}/{name}"
 	topnSchemaPath     = "/api/v1/topn-agg/schema/{group}/{name}"
+	measureListPath    = "/api/v1/measure/schema/lists/{group}"
+	streamListPath     = "/api/v1/stream/schema/lists/{group}"
+	traceListPath      = "/api/v1/trace/schema/lists/{group}"
+	propertyListPath   = "/api/v1/property/schema/lists/{group}"
+	topnListPath       = "/api/v1/topn-agg/schema/lists/{group}"
 	indexRuleListPath  = "/api/v1/index-rule/schema/lists/{group}"
 	bydbqlQueryPath    = "/api/v1/bydbql/query"
 )
@@ -86,12 +92,21 @@ func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequ
 	if fallbackErr != nil {
 		return session.SchemaSnapshot{}, fallbackErr
 	}
+	snapshot := fallbackSnapshot
+	if executor.config.Addr != "" && len(req.Groups) > 0 {
+		if resourceNames, listErr := executor.listResources(ctx, req.Groups[0], req.Type); listErr == nil {
+			snapshot.ResourceNames = resourceNames
+		}
+		if indexedFields, indexErr := executor.discoverIndexedFields(ctx, req.Groups[0]); indexErr == nil {
+			snapshot.IndexedFields = indexedFields
+		}
+	}
 	if executor.config.Addr == "" || req.Name == "" || len(req.Groups) == 0 {
-		return fallbackSnapshot, nil
+		return snapshot, nil
 	}
 	path, pathErr := schemaPath(req.Type)
 	if pathErr != nil {
-		return fallbackSnapshot, nil
+		return snapshot, nil
 	}
 	request := executor.client.R().
 		SetContext(ctx).
@@ -103,17 +118,38 @@ func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequ
 	}
 	response, requestErr := request.Get(executor.config.Addr + path)
 	if requestErr != nil || response.StatusCode() != http.StatusOK {
-		return fallbackSnapshot, nil
+		return snapshot, nil
 	}
 	schemaSnapshot, summarizeErr := summarizeSchema(req, response.Body(), executor.now())
 	if summarizeErr != nil {
-		return fallbackSnapshot, nil
+		return snapshot, nil
 	}
-	indexedFields, indexErr := executor.discoverIndexedFields(ctx, req.Groups[0])
-	if indexErr == nil && len(indexedFields) > 0 {
-		schemaSnapshot.IndexedFields = indexedFields
+	if len(snapshot.ResourceNames) > 0 {
+		schemaSnapshot.ResourceNames = snapshot.ResourceNames
+	}
+	if len(snapshot.IndexedFields) > 0 {
+		schemaSnapshot.IndexedFields = snapshot.IndexedFields
 	}
 	return schemaSnapshot, nil
+}
+
+func (executor *HTTPExecutor) listResources(ctx context.Context, group string, resourceType session.ResourceType) ([]string, error) {
+	listPath, listErr := resourceListPath(resourceType)
+	if listErr != nil {
+		return nil, listErr
+	}
+	request := executor.client.R().
+		SetContext(ctx).
+		SetPathParam("group", group).
+		SetHeader("Accept", "application/json")
+	if authHeader := executor.authHeader(); authHeader != "" {
+		request.SetHeader("Authorization", authHeader)
+	}
+	response, requestErr := request.Get(executor.config.Addr + listPath)
+	if requestErr != nil || response.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("resource list unavailable")
+	}
+	return resourceNamesFromList(resourceType, response.Body())
 }
 
 func (executor *HTTPExecutor) discoverIndexedFields(ctx context.Context, group string) ([]string, error) {
@@ -196,6 +232,9 @@ func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session
 	rows, resultType := responseRows(queryResponse)
 	executionResult.Rows = rows
 	executionResult.Summary = fmt.Sprintf("executed %s BYDBQL query through %s; rows=%d", resultType, bydbqlQueryPath, rows)
+	if rows == 0 {
+		executionResult.Hint = "query returned zero rows; consider widening the TIME range or verifying resource name, group, and filters"
+	}
 	return executionResult, nil
 }
 
@@ -221,6 +260,126 @@ func schemaPath(resourceType session.ResourceType) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported resource type: %s", resourceType)
 	}
+}
+
+func resourceListPath(resourceType session.ResourceType) (string, error) {
+	switch resourceType {
+	case session.ResourceTypeMeasure:
+		return measureListPath, nil
+	case session.ResourceTypeStream:
+		return streamListPath, nil
+	case session.ResourceTypeTrace:
+		return traceListPath, nil
+	case session.ResourceTypeProperty:
+		return propertyListPath, nil
+	case session.ResourceTypeTopN:
+		return topnListPath, nil
+	default:
+		return "", fmt.Errorf("unsupported resource type: %s", resourceType)
+	}
+}
+
+func resourceNamesFromList(resourceType session.ResourceType, body []byte) ([]string, error) {
+	switch resourceType {
+	case session.ResourceTypeMeasure:
+		listResponse := new(databasev1.MeasureRegistryServiceListResponse)
+		if unmarshalErr := protojson.Unmarshal(body, listResponse); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return metadataNames(extractMeasureMetadata(listResponse.GetMeasure())), nil
+	case session.ResourceTypeStream:
+		listResponse := new(databasev1.StreamRegistryServiceListResponse)
+		if unmarshalErr := protojson.Unmarshal(body, listResponse); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return metadataNames(extractStreamMetadata(listResponse.GetStream())), nil
+	case session.ResourceTypeTrace:
+		listResponse := new(databasev1.TraceRegistryServiceListResponse)
+		if unmarshalErr := protojson.Unmarshal(body, listResponse); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return metadataNames(extractTraceMetadata(listResponse.GetTrace())), nil
+	case session.ResourceTypeProperty:
+		listResponse := new(databasev1.PropertyRegistryServiceListResponse)
+		if unmarshalErr := protojson.Unmarshal(body, listResponse); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return metadataNames(extractPropertyMetadata(listResponse.GetProperties())), nil
+	case session.ResourceTypeTopN:
+		listResponse := new(databasev1.TopNAggregationRegistryServiceListResponse)
+		if unmarshalErr := protojson.Unmarshal(body, listResponse); unmarshalErr != nil {
+			return nil, unmarshalErr
+		}
+		return metadataNames(extractTopNMetadata(listResponse.GetTopNAggregation())), nil
+	default:
+		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
+	}
+}
+
+func extractMeasureMetadata(measures []*databasev1.Measure) []*commonv1.Metadata {
+	return extractMetadata(len(measures), func(idx int) *commonv1.Metadata {
+		if measures[idx] == nil {
+			return nil
+		}
+		return measures[idx].GetMetadata()
+	})
+}
+
+func extractStreamMetadata(streams []*databasev1.Stream) []*commonv1.Metadata {
+	return extractMetadata(len(streams), func(idx int) *commonv1.Metadata {
+		if streams[idx] == nil {
+			return nil
+		}
+		return streams[idx].GetMetadata()
+	})
+}
+
+func extractTraceMetadata(traces []*databasev1.Trace) []*commonv1.Metadata {
+	return extractMetadata(len(traces), func(idx int) *commonv1.Metadata {
+		if traces[idx] == nil {
+			return nil
+		}
+		return traces[idx].GetMetadata()
+	})
+}
+
+func extractPropertyMetadata(properties []*databasev1.Property) []*commonv1.Metadata {
+	return extractMetadata(len(properties), func(idx int) *commonv1.Metadata {
+		if properties[idx] == nil {
+			return nil
+		}
+		return properties[idx].GetMetadata()
+	})
+}
+
+func extractTopNMetadata(topNItems []*databasev1.TopNAggregation) []*commonv1.Metadata {
+	return extractMetadata(len(topNItems), func(idx int) *commonv1.Metadata {
+		if topNItems[idx] == nil {
+			return nil
+		}
+		return topNItems[idx].GetMetadata()
+	})
+}
+
+func extractMetadata(count int, at func(int) *commonv1.Metadata) []*commonv1.Metadata {
+	metadataItems := make([]*commonv1.Metadata, 0, count)
+	for idx := 0; idx < count; idx++ {
+		metadataItems = append(metadataItems, at(idx))
+	}
+	return metadataItems
+}
+
+func metadataNames(metadataItems []*commonv1.Metadata) []string {
+	var names []string
+	for _, metadata := range metadataItems {
+		if metadata == nil {
+			continue
+		}
+		if name := strings.TrimSpace(metadata.GetName()); name != "" {
+			names = append(names, name)
+		}
+	}
+	return compactStrings(names)
 }
 
 func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (session.SchemaSnapshot, error) {

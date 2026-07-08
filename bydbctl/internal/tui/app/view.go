@@ -121,15 +121,14 @@ func (m Model) renderWorkflow(width int) string {
 func (m Model) renderEvents(width int) string {
 	lines := []string{titleStyle.Render("Events")}
 	if len(m.events) == 0 {
-		lines = append(lines, mutedStyle.Render("No visible events yet"))
+		lines = append(lines, mutedStyle.Render("No events yet"))
 	} else {
-		startIdx := 0
-		if len(m.events) > 7 {
-			startIdx = len(m.events) - 7
-		}
-		for _, event := range m.events[startIdx:] {
+		for _, event := range m.events {
 			lines = append(lines, mutedStyle.Render(truncate(event, width-6)))
 		}
+	}
+	if logHint := formatLogHint(m.logPathDisplay); logHint != "" {
+		lines = append(lines, mutedStyle.Render(truncate(logHint, width-6)))
 	}
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }

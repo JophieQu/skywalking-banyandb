@@ -80,7 +80,9 @@ The left side contains:
 - `Goal`: the natural language question for the agent.
 - `Slots`: resource type, resource name, groups, and time range.
 - `Workflow`: the current workflow phase.
-- `Events`: visible workflow and agent updates.
+- `Events`: short workflow hints; full details are written to a session log file shown at the bottom of the panel.
+
+Each `bydbctl agent` run writes a timestamped log under `$HOME/.bydbctl/logs/agent-YYYYMMDD-HHMMSS.log`. Override the directory with `--log-dir`. When the TUI exits, the full log path is printed to stderr.
 
 The right side contains:
 
@@ -125,7 +127,7 @@ End:
 
 The TUI sends the goal, slots, schema summary (including indexed fields for ORDER BY), time range, query hints, a template baseline query, current BYDBQL candidate, validation errors, and execution errors to the configured agent. The agent returns a BYDBQL candidate. The candidate is written into the `BYDBQL Candidate` editor.
 
-With `--addr` set, bydbctl discovers schema and index rules directly from BanyanDB HTTP APIs. MCP is optional and not required for standalone use.
+With `--addr` set, bydbctl discovers schema, index rules, and available resource names in the group directly from BanyanDB HTTP APIs. Changing TUI slots (type, name, groups, time range, or goal) refreshes schema automatically before the next workflow action. MCP is optional and not required for standalone use.
 
 ## Edit, Validate, Execute, and Accept
 
@@ -150,7 +152,7 @@ You can continue after execution:
 1. Edit the BYDBQL manually, or leave the executed query as-is.
 2. Press `Ctrl+A`.
 
-The agent receives the current BYDBQL, validation errors, and execution errors from the last `Ctrl+E` run. This lets it revise the query based on syntax, semantic checks (such as non-indexed ORDER BY fields), or BanyanDB execution failures.
+The agent receives the current BYDBQL, validation errors, execution errors, and zero-row hints from the last `Ctrl+E` run. This lets it revise the query based on syntax, semantic checks (such as unknown tags/fields or non-indexed ORDER BY fields), or BanyanDB execution failures.
 
 ## Safety Rules
 
@@ -191,15 +193,15 @@ If `Ctrl+A` does not produce a useful query, check these fields first:
 - `Start` should be set for measure, stream, trace, and Top-N queries.
 
 `error: agent returned no BYDBQL candidate` means the agent finished a turn, but `bydbctl` could not find a usable BYDBQL statement in the
-response. The workflow expects exactly one `SELECT` or `SHOW TOP` statement, preferably in a fenced `bydbql` code block. The `Events` panel includes
-the compact raw agent output that failed extraction so you can see whether the agent answered with prose, asked a question, or returned malformed text.
+response. The workflow expects exactly one `SELECT` or `SHOW TOP` statement, preferably in a fenced `bydbql` code block. Check the session log
+file shown in `Events` for the full raw agent output.
 
 `error: agent candidate failed validation` means `bydbctl` did extract a candidate, but the BYDBQL parser rejected it after the configured retry
 limit. In this case:
 
 - `BYDBQL Candidate` shows the last invalid query so you can edit it directly.
 - `Validation / Approval` shows the parser or transformer error message.
-- `Events` shows the validation message and a one-line copy of the invalid candidate.
+- `Events` shows a short validation hint; the session log contains the full validation message and invalid candidate query.
 
 After fixing the editor content, press `Ctrl+V` to validate again. You can also press `Ctrl+A` again; the next agent request includes the current
 candidate and the validation error as repair context.
@@ -209,4 +211,4 @@ If `--agent codex-acp` fails to start, verify that `npx` is installed and can do
 If Codex ACP starts but cannot use BanyanDB tools, verify `--mcp-config`, `mcp/dist/index.js`, `mcp/tools/bin/bydbql-parse`, and the `BANYANDB_ADDRESS`
 inside `.mcp.json`.
 
-If execution fails, check `--addr`, `--username`, and `--password`, then look at the `Execution Preview` and `Events` panels for the HTTP status and error summary.
+If execution fails, check `--addr`, `--username`, and `--password`, then open the session log from `Events` for the HTTP status, error summary, and full agent transcript.

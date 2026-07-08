@@ -30,6 +30,7 @@ import (
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/workflow"
@@ -54,6 +55,8 @@ const (
 type Config struct {
 	AgentGateway agent.Gateway
 	Executor     tools.Executor
+	SessionLog   *applog.Logger
+	LogDir       string
 	Provider     string
 	Goal         string
 	ResourceType string
@@ -75,10 +78,12 @@ type Model struct {
 	start        textinput.Model
 	end          textinput.Model
 	resourceType session.ResourceType
-	provider     string
-	status       string
-	events       []string
-	width        int
+	provider       string
+	status         string
+	events         []string
+	sessionLog     *applog.Logger
+	logPathDisplay string
+	width          int
 	height       int
 	focus        int
 	busy         bool
@@ -107,6 +112,13 @@ func NewModel(config Config) Model {
 	groups := newTextInput(config.Groups, "group, or group1,group2")
 	start := newTextInput(config.Start, "time start, for example -30m")
 	end := newTextInput(config.End, "optional time end")
+	sessionLog := config.SessionLog
+	if sessionLog == nil {
+		createdLog, createErr := applog.New(config.LogDir)
+		if createErr == nil {
+			sessionLog = createdLog
+		}
+	}
 	model := Model{
 		runner: workflow.NewRunner(workflow.Config{
 			AgentGateway: agentGateway,
@@ -120,11 +132,17 @@ func NewModel(config Config) Model {
 		start:        start,
 		end:          end,
 		resourceType: session.NormalizeResourceType(config.ResourceType),
-		provider:     provider,
-		status:       "ready",
-		width:        defaultWidth,
-		height:       defaultHeight,
+		provider:       provider,
+		status:         "ready",
+		sessionLog:     sessionLog,
+		logPathDisplay: applog.DisplayPath(sessionLogPath(sessionLog)),
+		width:          defaultWidth,
+		height:         defaultHeight,
 	}
+	if sessionLog != nil {
+		sessionLog.Write("session", fmt.Sprintf("provider=%s addr=workflow", provider))
+	}
+	model.addEvent("ready: press Ctrl+A to ask agent")
 	model.resize(defaultWidth, defaultHeight)
 	model.syncFocus()
 	return model
@@ -155,16 +173,30 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.addAgentEvents(typedMsg.events)
-		if m.querySession != nil && !m.querySession.Validation.Valid && strings.TrimSpace(m.querySession.Validation.Message) != "" {
-			m.addEvent("validation: " + m.querySession.Validation.Message)
-			if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil && strings.TrimSpace(currentCandidate.Query) != "" {
-				m.addEvent("invalid candidate: " + singleLine(currentCandidate.Query))
+		if m.querySession != nil {
+			if validationHint := formatValidationHint(m.querySession.Validation.Message); validationHint != "" {
+				m.addUIEvent(validationHint)
+				m.logWrite("validation", m.querySession.Validation.Message)
 			}
+			if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil && strings.TrimSpace(currentCandidate.Query) != "" {
+				if !m.querySession.Validation.Valid {
+					if invalidHint := formatInvalidCandidateHint(currentCandidate.Query); invalidHint != "" {
+						m.addUIEvent(invalidHint)
+					}
+					m.logWrite("candidate", currentCandidate.Query)
+				}
+			}
+			m.logQuerySession(m.querySession)
 		}
 		if typedMsg.err != nil {
 			m.status = typedMsg.err.Error()
-			m.addEvent("error: " + typedMsg.err.Error())
+			m.addUIEvent(summarizeError("error", typedMsg.err.Error()))
+			m.logWriteError("workflow", typedMsg.err)
 			return m, nil
+		}
+		if typedMsg.status != "" {
+			m.addUIEvent(summarizeStatusEvent(typedMsg.status))
+			m.logWrite("workflow", typedMsg.status)
 		}
 		m.status = typedMsg.status
 		return m, nil
@@ -229,6 +261,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.busy = true
 		m.status = "asking agent"
+		m.logWrite("action", "ctrl+a agent revision")
 		return m.agentCmd(), true
 	case "ctrl+v":
 		if m.busy {
@@ -236,6 +269,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.busy = true
 		m.status = "validating query"
+		m.logWrite("action", "ctrl+v validate query")
 		return m.validateCmd(), true
 	case "ctrl+e":
 		if m.busy {
@@ -243,6 +277,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.busy = true
 		m.status = "executing query"
+		m.logWrite("action", "ctrl+e execute query")
 		return m.executeCmd(), true
 	case "ctrl+x":
 		if m.busy {
@@ -250,6 +285,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.busy = true
 		m.status = "accepting query"
+		m.logWrite("action", "ctrl+x accept query")
 		return m.acceptCmd(), true
 	default:
 		return nil, false
@@ -444,6 +480,12 @@ func ensureSession(
 		if startErr != nil {
 			return nil, startErr
 		}
+	} else {
+		var syncErr error
+		updatedSession, syncErr = runner.SyncSession(ctx, updatedSession, options)
+		if syncErr != nil {
+			return nil, syncErr
+		}
 	}
 	currentCandidate := updatedSession.CurrentCandidate()
 	if strings.TrimSpace(query) != "" && (currentCandidate == nil || strings.TrimSpace(currentCandidate.Query) != strings.TrimSpace(query)) {
@@ -471,23 +513,70 @@ func nextResourceType(resourceType session.ResourceType) session.ResourceType {
 
 func (m *Model) addAgentEvents(events []agent.Event) {
 	for _, event := range events {
-		if strings.TrimSpace(event.Message) != "" {
-			m.addEvent(fmt.Sprintf("%s: %s", event.Kind, event.Message))
-		}
-		if strings.TrimSpace(event.Candidate) != "" {
-			m.addEvent("candidate: " + singleLine(event.Candidate))
+		m.logAgentEvent(event)
+		if uiEvent := summarizeAgentEvent(event); shouldShowAgentEvent(event) && uiEvent != "" {
+			m.addUIEvent(uiEvent)
 		}
 	}
 }
 
+func shouldShowAgentEvent(event agent.Event) bool {
+	switch event.Kind {
+	case agent.EventKindMessageDelta:
+		return false
+	default:
+		return true
+	}
+}
+
 func (m *Model) addEvent(event string) {
+	m.addUIEvent(summarizeStatusEvent(event))
+	m.logWrite("event", event)
+}
+
+func (m *Model) addUIEvent(event string) {
 	if strings.TrimSpace(event) == "" {
 		return
 	}
 	m.events = append(m.events, event)
-	if len(m.events) > 12 {
-		m.events = m.events[len(m.events)-12:]
+	if len(m.events) > maxVisibleEvents {
+		m.events = m.events[len(m.events)-maxVisibleEvents:]
 	}
+}
+
+func (m *Model) logWrite(category, message string) {
+	if m.sessionLog == nil {
+		return
+	}
+	m.sessionLog.Write(category, message)
+}
+
+func (m *Model) logWriteError(category string, err error) {
+	if m.sessionLog == nil {
+		return
+	}
+	m.sessionLog.WriteError(category, err)
+}
+
+func (m *Model) logAgentEvent(event agent.Event) {
+	if m.sessionLog == nil {
+		return
+	}
+	m.sessionLog.WriteAgentEvent(event)
+}
+
+func (m *Model) logQuerySession(querySession *session.QuerySession) {
+	if m.sessionLog == nil {
+		return
+	}
+	m.sessionLog.WriteQuerySession(querySession)
+}
+
+func sessionLogPath(sessionLog *applog.Logger) string {
+	if sessionLog == nil {
+		return ""
+	}
+	return sessionLog.Path()
 }
 
 func singleLine(value string) string {

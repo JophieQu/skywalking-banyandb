@@ -27,6 +27,41 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 )
 
+func TestSyncSessionUpdatesSlots(t *testing.T) {
+	runner := NewRunner(Config{AgentGateway: fake.NewGateway()})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"default"},
+		Goal:         "first goal",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	updatedSession, syncErr := runner.SyncSession(context.Background(), querySession, StartOptions{
+		ResourceType: session.ResourceTypeStream,
+		ResourceName: "sw",
+		Groups:       []string{"production"},
+		Goal:         "updated goal",
+		TimeRange:    session.TimeRange{Start: "-1h"},
+	})
+	if syncErr != nil {
+		t.Fatalf("SyncSession returned error: %v", syncErr)
+	}
+	if updatedSession.ResourceName != "sw" {
+		t.Fatalf("unexpected resource name: %s", updatedSession.ResourceName)
+	}
+	if updatedSession.ResourceType != session.ResourceTypeStream {
+		t.Fatalf("unexpected resource type: %s", updatedSession.ResourceType)
+	}
+	if updatedSession.UserGoal != "updated goal" {
+		t.Fatalf("unexpected goal: %s", updatedSession.UserGoal)
+	}
+	if len(updatedSession.Transcript) < 2 {
+		t.Fatalf("expected refresh transcript entry: %+v", updatedSession.Transcript)
+	}
+}
+
 func TestStartSessionDiscoversSchemaWithoutCandidate(t *testing.T) {
 	runner := NewRunner(Config{AgentGateway: fake.NewGateway()})
 	querySession, startErr := runner.StartSession(context.Background(), StartOptions{

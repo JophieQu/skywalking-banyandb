@@ -31,6 +31,7 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/acp"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/codex"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
 	tuiapp "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/app"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 	"github.com/apache/skywalking-banyandb/pkg/version"
@@ -56,6 +57,7 @@ func newAgentCmd() *cobra.Command {
 	var initialStart string
 	var initialEnd string
 	var maxRetries int
+	var logDir string
 	agentCmd := &cobra.Command{
 		Use:     "agent",
 		Version: version.Build(),
@@ -72,6 +74,13 @@ func newAgentCmd() *cobra.Command {
 			if gatewayErr != nil {
 				return gatewayErr
 			}
+			sessionLog, logErr := applog.New(logDir)
+			if logErr != nil {
+				return fmt.Errorf("failed to create agent session log: %w", logErr)
+			}
+			defer func() {
+				_ = sessionLog.Close()
+			}()
 			model := tuiapp.NewModel(tuiapp.Config{
 				AgentGateway: agentGateway,
 				Executor: tools.NewHTTPExecutor(tools.HTTPConfig{
@@ -79,6 +88,7 @@ func newAgentCmd() *cobra.Command {
 					Username: viper.GetString("username"),
 					Password: viper.GetString("password"),
 				}),
+				SessionLog:   sessionLog,
 				Provider:     agentProvider,
 				Goal:         initialGoal,
 				ResourceType: initialResourceType,
@@ -92,6 +102,7 @@ func newAgentCmd() *cobra.Command {
 			if _, runErr := program.Run(); runErr != nil {
 				return fmt.Errorf("failed to run agent TUI: %w", runErr)
 			}
+			fmt.Fprintf(os.Stderr, "agent session log: %s\n", sessionLog.Path())
 			return nil
 		},
 	}
@@ -107,6 +118,7 @@ func newAgentCmd() *cobra.Command {
 	agentCmd.Flags().StringVar(&initialStart, "start", "-30m", "initial BYDBQL time start")
 	agentCmd.Flags().StringVar(&initialEnd, "end", "", "initial BYDBQL time end")
 	agentCmd.Flags().IntVar(&maxRetries, "agent-retries", 2, "maximum agent repair retries after validation errors")
+	agentCmd.Flags().StringVar(&logDir, "log-dir", "", "directory for agent session logs; default is $HOME/.bydbctl/logs")
 	return agentCmd
 }
 

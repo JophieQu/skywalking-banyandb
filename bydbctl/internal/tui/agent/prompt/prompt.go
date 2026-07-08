@@ -117,7 +117,8 @@ func writeNLRules(prompt *bytes.Buffer) {
 	prompt.WriteString("- Slots (type, name, groups, time_range) override names inferred from the goal.\n")
 	prompt.WriteString("- query_hints.prefer_show_top=true means use SHOW TOP, not SELECT with LIMIT.\n")
 	prompt.WriteString("- Distinguish time ranges (TIME clause) from data-point limits (LIMIT clause).\n")
-	prompt.WriteString("- template_hint shows a valid baseline query for the current slots; adapt it to the goal.\n\n")
+	prompt.WriteString("- template_hint shows a valid baseline query for the current slots; adapt it to the goal.\n")
+	prompt.WriteString("- schema.available_resources lists resource names in the current group when the name slot may be wrong.\n\n")
 }
 
 func writeReferences(prompt *bytes.Buffer) {

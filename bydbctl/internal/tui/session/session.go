@@ -90,6 +90,7 @@ type SchemaSnapshot struct {
 	Tags          []string
 	Fields        []string
 	IndexedFields []string
+	ResourceNames []string
 }
 
 // CandidateSource records where a BYDBQL candidate came from.
@@ -140,6 +141,7 @@ type ExecutionResult struct {
 	Path      string
 	Response  string
 	Error     string
+	Hint      string
 }
 
 // TranscriptEntry is one visible agent or workflow event.

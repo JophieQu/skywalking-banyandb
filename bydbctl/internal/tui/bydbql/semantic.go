@@ -74,6 +74,9 @@ func (validator *SemanticValidator) semanticMessage(query string, schema *sessio
 			return fmt.Sprintf("ORDER BY field %q is not indexed; omit ORDER BY or choose one of: %s", orderField, strings.Join(schema.IndexedFields, ", "))
 		}
 	}
+	if identifierMessage := validateSchemaIdentifiers(query, schema); identifierMessage != "" {
+		return identifierMessage
+	}
 	return ""
 }
 

@@ -57,6 +57,20 @@ func TestHTTPExecutorDiscoverSchema(t *testing.T) {
 			_, _ = writer.Write(body)
 			return
 		}
+		if strings.HasPrefix(request.URL.Path, "/api/v1/measure/schema/lists/") {
+			listResponse := &databasev1.MeasureRegistryServiceListResponse{
+				Measure: []*databasev1.Measure{
+					{Metadata: &commonv1.Metadata{Name: "service_latency", Group: "production"}},
+					{Metadata: &commonv1.Metadata{Name: "service_cpm", Group: "production"}},
+				},
+			}
+			body, marshalErr := protojson.Marshal(listResponse)
+			if marshalErr != nil {
+				t.Fatalf("failed to marshal measure list: %v", marshalErr)
+			}
+			_, _ = writer.Write(body)
+			return
+		}
 		measure := &databasev1.Measure{
 			Metadata: &commonv1.Metadata{
 				Group: "production",
@@ -111,8 +125,14 @@ func TestHTTPExecutorDiscoverSchema(t *testing.T) {
 	if !reflect.DeepEqual(snapshot.Fields, []string{"latency", "cpm"}) {
 		t.Fatalf("unexpected fields: %v", snapshot.Fields)
 	}
+	if !containsPath(gotPaths, "/api/v1/measure/schema/lists/production") {
+		t.Fatalf("unexpected paths: %v", gotPaths)
+	}
 	if !reflect.DeepEqual(snapshot.IndexedFields, []string{"endpoint"}) {
 		t.Fatalf("unexpected indexed fields: %v", snapshot.IndexedFields)
+	}
+	if !reflect.DeepEqual(snapshot.ResourceNames, []string{"service_latency", "service_cpm"}) {
+		t.Fatalf("unexpected resource names: %v", snapshot.ResourceNames)
 	}
 }
 
