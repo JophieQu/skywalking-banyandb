@@ -55,6 +55,12 @@ var fragmentedTokenReplacements = []struct {
 	{old: "b yd b ql", new: "bydbql"},
 	{old: "SH OW", new: "SHOW"},
 	{old: "A GG REG ATE", new: "AGGREGATE"},
+	{old: "AGGREGATE BY AV G", new: "AGGREGATE BY AVG"},
+	{old: "AGGREGATE BY MA X", new: "AGGREGATE BY MAX"},
+	{old: "AGGREGATE BY MI N", new: "AGGREGATE BY MIN"},
+	{old: "AV G", new: "AVG"},
+	{old: "MA X", new: "MAX"},
+	{old: "MI N", new: "MIN"},
 	{old: "TOP text 10", new: "TOP 10"},
 	{old: "TOP text ", new: "TOP "},
 	{old: "ME ASURE", new: "MEASURE"},
@@ -282,7 +288,7 @@ func (runner *Runner) ReviseWithAgent(ctx context.Context, querySession *session
 			querySession.Phase = session.PhaseError
 			return allEvents, turnErr
 		}
-		candidate := finalCandidate(turnEvents)
+		candidate := RepairFragmentedQuery(finalCandidate(turnEvents))
 		if strings.TrimSpace(candidate) == "" {
 			querySession.Phase = session.PhaseError
 			outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
@@ -605,6 +611,15 @@ func extractCandidateFromFragmentedText(text string) string {
 		return ""
 	}
 	return extractCandidateFromText(normalizedText)
+}
+
+// RepairFragmentedQuery normalizes ACP fragmented BYDBQL text into a single statement.
+func RepairFragmentedQuery(query string) string {
+	normalizedQuery := normalizeFragmentedAgentText(query)
+	if normalizedQuery == "" {
+		return strings.TrimSpace(query)
+	}
+	return normalizedQuery
 }
 
 func normalizeFragmentedAgentText(text string) string {

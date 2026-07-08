@@ -57,14 +57,14 @@ func ResolveSessionSlots(options StartOptions, catalog session.SchemaCatalog) Re
 		SlotsPinned:  slotsPinned,
 	}
 	if slotsPinned {
-		return finalizeResolvedSlots(resolved)
+		return finalizeResolvedSlots(resolved, catalog)
 	}
 	if len(catalog.Entries) == 0 {
-		return finalizeResolvedSlots(resolved)
+		return finalizeResolvedSlots(resolved, catalog)
 	}
 	match := matchResourceFromGoal(goal, catalog, resourceType, resourceName, groups)
 	if !match.Matched {
-		return finalizeResolvedSlots(resolved)
+		return finalizeResolvedSlots(resolved, catalog)
 	}
 	if resourceName == "" {
 		resolved.ResourceName = match.Name
@@ -78,7 +78,7 @@ func ResolveSessionSlots(options StartOptions, catalog session.SchemaCatalog) Re
 		resolved.ResourceType = match.Type
 		resolved.AutoMatched = true
 	}
-	return finalizeResolvedSlots(resolved)
+	return finalizeResolvedSlots(resolved, catalog)
 }
 
 type catalogMatch struct {
@@ -112,7 +112,7 @@ func matchResourceFromGoal(
 		if preferredType != "" && preferredType != preferredTypeHint && entry.Type != preferredType {
 			continue
 		}
-		score := scoreCatalogEntry(goal, goalTokens, entry, preferredTypeHint)
+		score := scoreCatalogEntry(goal, goalTokens, entry, preferredTypeHint, len(catalog.Groups))
 		if score > bestMatch.Score {
 			bestMatch = catalogMatch{
 				Matched: score > 0,
@@ -126,7 +126,7 @@ func matchResourceFromGoal(
 	return bestMatch
 }
 
-func scoreCatalogEntry(goal string, goalTokens []string, entry session.CatalogEntry, preferredType session.ResourceType) int {
+func scoreCatalogEntry(goal string, goalTokens []string, entry session.CatalogEntry, preferredType session.ResourceType, catalogGroupCount int) int {
 	score := 0
 	entryName := strings.ToLower(entry.Name)
 	entryGroup := strings.ToLower(entry.Group)
@@ -154,11 +154,17 @@ func scoreCatalogEntry(goal string, goalTokens []string, entry session.CatalogEn
 	if entry.Type == preferredType {
 		score += 8
 	}
+	if entry.Group == defaultGroupName && catalogGroupCount > 1 {
+		score -= 8
+	}
+	if strings.Contains(entryGroup, "metric") && (strings.Contains(normalizedGoal, "metric") || strings.Contains(normalizedGoal, "endpoint") || strings.Contains(normalizedGoal, "latency")) {
+		score += 6
+	}
 	score += typeKeywordScore(normalizedGoal, entry.Type)
 	if strings.Contains(entryName, "latency") && strings.Contains(normalizedGoal, "slow") {
 		score += 8
 	}
-	if strings.Contains(entryName, "endpoint") && strings.Contains(normalizedGoal, "endpoint") {
+	if strings.Contains(entryName, "endpoint") && (strings.Contains(normalizedGoal, "endpoint") || strings.Contains(normalizedGoal, "payment")) {
 		score += 8
 	}
 	return score
@@ -227,7 +233,16 @@ func applyTimeDefaults(timeRange session.TimeRange) session.TimeRange {
 	}
 }
 
-func finalizeResolvedSlots(resolved ResolvedSlots) ResolvedSlots {
+func finalizeResolvedSlots(resolved ResolvedSlots, catalog session.SchemaCatalog) ResolvedSlots {
+	if shouldPreferCatalogMatch(resolved) && len(catalog.Entries) > 0 {
+		match := matchResourceFromGoal(resolved.Goal, catalog, resolved.ResourceType, "", nil)
+		if match.Matched {
+			resolved.ResourceName = match.Name
+			resolved.Groups = []string{match.Group}
+			resolved.ResourceType = match.Type
+			resolved.AutoMatched = true
+		}
+	}
 	if strings.TrimSpace(resolved.ResourceName) == "" {
 		resolved.ResourceName = defaultResourceName
 	}
@@ -235,6 +250,19 @@ func finalizeResolvedSlots(resolved ResolvedSlots) ResolvedSlots {
 		resolved.Groups = []string{defaultGroupName}
 	}
 	return resolved
+}
+
+func shouldPreferCatalogMatch(resolved ResolvedSlots) bool {
+	if resolved.SlotsPinned {
+		return false
+	}
+	if strings.TrimSpace(resolved.ResourceName) == "" || resolved.ResourceName == defaultResourceName {
+		return true
+	}
+	if len(resolved.Groups) == 0 || (len(resolved.Groups) == 1 && resolved.Groups[0] == defaultGroupName) {
+		return true
+	}
+	return false
 }
 
 func containsString(values []string, target string) bool {

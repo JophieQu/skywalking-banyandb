@@ -108,28 +108,77 @@ func (sessionLogger *Logger) WriteError(category string, err error) {
 	sessionLogger.Write(category, err.Error())
 }
 
-// WriteAgentEvent appends a full agent event record.
-func (sessionLogger *Logger) WriteAgentEvent(event agent.Event) {
-	if sessionLogger == nil {
+// WriteAgentTurn appends one summary line per agent turn instead of per delta event.
+func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
+	if sessionLogger == nil || len(events) == 0 {
 		return
 	}
-	parts := []string{fmt.Sprintf("kind=%s", event.Kind)}
-	if strings.TrimSpace(event.Message) != "" {
-		parts = append(parts, "message="+event.Message)
+	deltaCount := 0
+	var otherKinds []string
+	var finalMessage, candidate, explanation string
+	var agentErr error
+	for _, event := range events {
+		switch event.Kind {
+		case agent.EventKindMessageDelta:
+			if strings.TrimSpace(event.Message) != "" {
+				deltaCount++
+			}
+		case agent.EventKindFinalResponse:
+			if strings.TrimSpace(event.Message) != "" {
+				finalMessage = event.Message
+			}
+			if strings.TrimSpace(event.Candidate) != "" {
+				candidate = event.Candidate
+			}
+			if strings.TrimSpace(event.Explanation) != "" {
+				explanation = event.Explanation
+			}
+		case agent.EventKindError:
+			if event.Err != nil {
+				agentErr = event.Err
+			}
+		default:
+			otherKinds = append(otherKinds, string(event.Kind))
+		}
 	}
-	if strings.TrimSpace(event.Candidate) != "" {
-		parts = append(parts, "candidate="+event.Candidate)
+	parts := []string{fmt.Sprintf("events=%d", len(events))}
+	if deltaCount > 0 {
+		parts = append(parts, fmt.Sprintf("non_empty_deltas=%d", deltaCount))
 	}
-	if strings.TrimSpace(event.Explanation) != "" {
-		parts = append(parts, "explanation="+event.Explanation)
+	if len(otherKinds) > 0 {
+		parts = append(parts, "kinds="+strings.Join(otherKinds, ","))
 	}
-	if strings.TrimSpace(event.Permission) != "" {
-		parts = append(parts, "permission="+event.Permission)
+	if candidate != "" {
+		parts = append(parts, "candidate="+truncateLogField(candidate))
 	}
-	if event.Err != nil {
-		parts = append(parts, "error="+event.Err.Error())
+	if explanation != "" {
+		parts = append(parts, "explanation="+truncateLogField(explanation))
 	}
-	sessionLogger.Write("agent", strings.Join(parts, " | "))
+	if finalMessage != "" && candidate == "" {
+		parts = append(parts, "message="+truncateLogField(finalMessage))
+	}
+	if candidate == "" && finalMessage == "" && deltaCount > 0 {
+		var deltaMessages []string
+		for _, event := range events {
+			if event.Kind == agent.EventKindMessageDelta && strings.TrimSpace(event.Message) != "" {
+				deltaMessages = append(deltaMessages, event.Message)
+			}
+		}
+		parts = append(parts, "message="+truncateLogField(strings.Join(deltaMessages, "")))
+	}
+	if agentErr != nil {
+		parts = append(parts, "error="+agentErr.Error())
+	}
+	sessionLogger.Write("agent_turn", strings.Join(parts, " | "))
+}
+
+func truncateLogField(value string) string {
+	trimmedValue := strings.Join(strings.Fields(value), " ")
+	const maxLogFieldLength = 500
+	if len(trimmedValue) <= maxLogFieldLength {
+		return trimmedValue
+	}
+	return trimmedValue[:maxLogFieldLength] + "..."
 }
 
 // WriteQuerySession appends the current workflow snapshot.

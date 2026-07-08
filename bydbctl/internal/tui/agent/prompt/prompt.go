@@ -109,6 +109,7 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 		prompt.WriteString("- For exploratory SELECT queries, include LIMIT 10 unless query_hints specify otherwise.\n")
 	} else {
 		prompt.WriteString("- Fix validation_error or execution_summary.error when present; preserve correct parts of the candidate.\n")
+		prompt.WriteString("- Return only the fenced bydbql block; do not echo validation metadata, JSON fields, or explanatory prose.\n")
 	}
 	prompt.WriteString("- ORDER BY may only use fields listed in schema.indexed_fields; omit ORDER BY when no indexed field matches.\n\n")
 }

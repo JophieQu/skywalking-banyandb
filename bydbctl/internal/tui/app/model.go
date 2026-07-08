@@ -527,11 +527,11 @@ func nextResourceType(resourceType session.ResourceType) session.ResourceType {
 
 func (m *Model) addAgentEvents(events []agent.Event) {
 	for _, event := range events {
-		m.logAgentEvent(event)
 		if uiEvent := summarizeAgentEvent(event); shouldShowAgentEvent(event) && uiEvent != "" {
 			m.addUIEvent(uiEvent)
 		}
 	}
+	m.logAgentTurn(events)
 }
 
 func shouldShowAgentEvent(event agent.Event) bool {
@@ -572,11 +572,11 @@ func (m *Model) logWriteError(category string, err error) {
 	m.sessionLog.WriteError(category, err)
 }
 
-func (m *Model) logAgentEvent(event agent.Event) {
+func (m *Model) logAgentTurn(events []agent.Event) {
 	if m.sessionLog == nil {
 		return
 	}
-	m.sessionLog.WriteAgentEvent(event)
+	m.sessionLog.WriteAgentTurn(events)
 }
 
 func (m *Model) logQuerySession(querySession *session.QuerySession) {

@@ -35,9 +35,9 @@ func TestNewWritesSessionLog(t *testing.T) {
 	defer func() {
 		_ = sessionLog.Close()
 	}()
-	sessionLog.WriteAgentEvent(agent.Event{
-		Kind:    agent.EventKindMessageDelta,
-		Message: "agent raw output",
+	sessionLog.WriteAgentTurn([]agent.Event{
+		{Kind: agent.EventKindMessageDelta, Message: "agent raw output"},
+		{Kind: agent.EventKindFinalResponse, Message: "agent raw output"},
 	})
 	sessionLog.WriteError("workflow", os.ErrInvalid)
 	logBytes, readErr := os.ReadFile(sessionLog.Path())

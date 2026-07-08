@@ -266,6 +266,15 @@ func TestNormalizeFragmentedAgentTextTimeRange(t *testing.T) {
 	}
 }
 
+func TestRepairFragmentedQueryAggregateAVG(t *testing.T) {
+	input := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN default TIME > '-30m' AGGREGATE BY AV G ORDER BY DESC"
+	want := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN default TIME > '-30m' AGGREGATE BY AVG ORDER BY DESC"
+	got := RepairFragmentedQuery(input)
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestFinalCandidateClaudeACPFragmentedShowTop(t *testing.T) {
 	fragments := []string{
 		"```", "b", "yd", "b", "ql", "text", "SH", "OW", "TOP", "text", "10", "FROM", "ME", "AS", "URE",
