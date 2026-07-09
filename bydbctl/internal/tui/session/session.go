@@ -88,11 +88,13 @@ type SchemaSnapshot struct {
 	Name            string
 	Groups          []string
 	Tags            []string
+	EntityTags      []string
 	Fields          []string
 	IndexedFields   []string
 	ResourceNames   []string
 	AvailableGroups []string
 	Catalog         []CatalogEntry
+	Loaded          bool
 }
 
 // CatalogEntry is one discoverable BanyanDB resource in a group.
@@ -167,6 +169,14 @@ type TranscriptEntry struct {
 	Content   string
 }
 
+// ConversationTurn is one user-agent exchange in the BYDBQL drafting loop.
+type ConversationTurn struct {
+	CreatedAt time.Time
+	Hint      string
+	Response  string
+	Candidate string
+}
+
 // QuerySession is the workflow contract between the TUI, agent gateway, validator, and tool executor.
 type QuerySession struct {
 	ID              string
@@ -179,6 +189,8 @@ type QuerySession struct {
 	SchemaSnapshot  SchemaSnapshot
 	SlotsPinned     bool
 	AutoMatched     bool
+	AgentSessionID  string
+	Conversation    []ConversationTurn
 	Candidates      []BydbqlCandidate
 	Validation      ValidationReport
 	ExecutionResult ExecutionResult
@@ -198,6 +210,14 @@ func (qs *QuerySession) CurrentCandidate() *BydbqlCandidate {
 func (qs *QuerySession) AddCandidate(candidate BydbqlCandidate) {
 	qs.Candidates = append(qs.Candidates, candidate)
 	qs.Validation = candidate.Validation
+}
+
+// AddConversationTurn appends one user-agent exchange to the session history.
+func (qs *QuerySession) AddConversationTurn(turn ConversationTurn) {
+	if strings.TrimSpace(turn.Hint) == "" && strings.TrimSpace(turn.Response) == "" && strings.TrimSpace(turn.Candidate) == "" {
+		return
+	}
+	qs.Conversation = append(qs.Conversation, turn)
 }
 
 // AddTranscript appends a visible workflow or agent event.

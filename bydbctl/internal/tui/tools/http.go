@@ -47,8 +47,9 @@ const (
 	traceListPath      = "/api/v1/trace/schema/lists/{group}"
 	propertyListPath   = "/api/v1/property/schema/lists/{group}"
 	topnListPath       = "/api/v1/topn-agg/schema/lists/{group}"
-	indexRuleListPath  = "/api/v1/index-rule/schema/lists/{group}"
-	bydbqlQueryPath    = "/api/v1/bydbql/query"
+	indexRuleListPath         = "/api/v1/index-rule/schema/lists/{group}"
+	indexRuleBindingListPath  = "/api/v1/index-rule-binding/schema/lists/{group}"
+	bydbqlQueryPath           = "/api/v1/bydbql/query"
 )
 
 // HTTPConfig configures schema discovery through BanyanDB's HTTP API.
@@ -167,24 +168,17 @@ func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequ
 		return session.SchemaSnapshot{}, fallbackErr
 	}
 	snapshot := fallbackSnapshot
-	if executor.config.Addr != "" && len(req.Groups) > 0 {
-		if resourceNames, listErr := executor.listResources(ctx, req.Groups[0], req.Type); listErr == nil {
-			snapshot.ResourceNames = resourceNames
-		}
-		if indexedFields, indexErr := executor.discoverIndexedFields(ctx, req.Groups[0]); indexErr == nil {
-			snapshot.IndexedFields = indexedFields
-		}
-	}
 	if executor.config.Addr == "" || req.Name == "" || len(req.Groups) == 0 {
 		return snapshot, nil
 	}
+	group := req.Groups[0]
 	path, pathErr := schemaPath(req.Type)
 	if pathErr != nil {
 		return snapshot, nil
 	}
 	request := executor.client.R().
 		SetContext(ctx).
-		SetPathParam("group", req.Groups[0]).
+		SetPathParam("group", group).
 		SetPathParam("name", req.Name).
 		SetHeader("Accept", "application/json")
 	if authHeader := executor.authHeader(); authHeader != "" {
@@ -192,17 +186,21 @@ func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequ
 	}
 	response, requestErr := request.Get(executor.config.Addr + path)
 	if requestErr != nil || response.StatusCode() != http.StatusOK {
+		if resourceNames, listErr := executor.listResources(ctx, group, req.Type); listErr == nil {
+			snapshot.ResourceNames = resourceNames
+		}
 		return snapshot, nil
 	}
 	schemaSnapshot, summarizeErr := summarizeSchema(req, response.Body(), executor.now())
 	if summarizeErr != nil {
 		return snapshot, nil
 	}
-	if len(snapshot.ResourceNames) > 0 {
-		schemaSnapshot.ResourceNames = snapshot.ResourceNames
+	schemaSnapshot.Loaded = true
+	if resourceNames, listErr := executor.listResources(ctx, group, req.Type); listErr == nil {
+		schemaSnapshot.ResourceNames = resourceNames
 	}
-	if len(snapshot.IndexedFields) > 0 {
-		schemaSnapshot.IndexedFields = snapshot.IndexedFields
+	if indexedTags, indexErr := executor.discoverResourceIndexedTags(ctx, group, req.Type, req.Name); indexErr == nil {
+		schemaSnapshot.IndexedFields = indexedTags
 	}
 	return schemaSnapshot, nil
 }
@@ -226,7 +224,82 @@ func (executor *HTTPExecutor) listResources(ctx context.Context, group string, r
 	return resourceNamesFromList(resourceType, response.Body())
 }
 
-func (executor *HTTPExecutor) discoverIndexedFields(ctx context.Context, group string) ([]string, error) {
+func (executor *HTTPExecutor) discoverResourceIndexedTags(
+	ctx context.Context,
+	group string,
+	resourceType session.ResourceType,
+	resourceName string,
+) ([]string, error) {
+	indexRules, rulesErr := executor.listIndexRules(ctx, group)
+	if rulesErr != nil {
+		return nil, rulesErr
+	}
+	bindings, bindingsErr := executor.listIndexRuleBindings(ctx, group)
+	if bindingsErr != nil {
+		return nil, bindingsErr
+	}
+	boundRuleNames := boundRuleNamesForResource(bindings, resourceType, resourceName)
+	var indexedTags []string
+	for _, indexRule := range indexRules {
+		ruleName := strings.TrimSpace(indexRule.GetMetadata().GetName())
+		if ruleName == "" {
+			continue
+		}
+		if _, ok := boundRuleNames[ruleName]; !ok {
+			continue
+		}
+		if indexRule.GetNoSort() {
+			continue
+		}
+		indexedTags = append(indexedTags, indexRule.GetTags()...)
+	}
+	return compactStrings(indexedTags), nil
+}
+
+func boundRuleNamesForResource(
+	bindings []*databasev1.IndexRuleBinding,
+	resourceType session.ResourceType,
+	resourceName string,
+) map[string]struct{} {
+	expectedCatalog := resourceCatalog(resourceType)
+	boundRuleNames := make(map[string]struct{})
+	for _, binding := range bindings {
+		subject := binding.GetSubject()
+		if subject == nil {
+			continue
+		}
+		if strings.TrimSpace(subject.GetName()) != resourceName {
+			continue
+		}
+		if expectedCatalog != commonv1.Catalog_CATALOG_UNSPECIFIED && subject.GetCatalog() != expectedCatalog {
+			continue
+		}
+		for _, ruleName := range binding.GetRules() {
+			trimmedRuleName := strings.TrimSpace(ruleName)
+			if trimmedRuleName != "" {
+				boundRuleNames[trimmedRuleName] = struct{}{}
+			}
+		}
+	}
+	return boundRuleNames
+}
+
+func resourceCatalog(resourceType session.ResourceType) commonv1.Catalog {
+	switch resourceType {
+	case session.ResourceTypeStream:
+		return commonv1.Catalog_CATALOG_STREAM
+	case session.ResourceTypeMeasure:
+		return commonv1.Catalog_CATALOG_MEASURE
+	case session.ResourceTypeProperty:
+		return commonv1.Catalog_CATALOG_PROPERTY
+	case session.ResourceTypeTrace:
+		return commonv1.Catalog_CATALOG_TRACE
+	default:
+		return commonv1.Catalog_CATALOG_UNSPECIFIED
+	}
+}
+
+func (executor *HTTPExecutor) listIndexRules(ctx context.Context, group string) ([]*databasev1.IndexRule, error) {
 	request := executor.client.R().
 		SetContext(ctx).
 		SetPathParam("group", group).
@@ -242,16 +315,26 @@ func (executor *HTTPExecutor) discoverIndexedFields(ctx context.Context, group s
 	if unmarshalErr := protojson.Unmarshal(response.Body(), listResponse); unmarshalErr != nil {
 		return nil, unmarshalErr
 	}
-	var indexedFields []string
-	for _, indexRule := range listResponse.GetIndexRule() {
-		if indexRule.GetNoSort() {
-			continue
-		}
-		if ruleName := strings.TrimSpace(indexRule.GetMetadata().GetName()); ruleName != "" {
-			indexedFields = append(indexedFields, ruleName)
-		}
+	return listResponse.GetIndexRule(), nil
+}
+
+func (executor *HTTPExecutor) listIndexRuleBindings(ctx context.Context, group string) ([]*databasev1.IndexRuleBinding, error) {
+	request := executor.client.R().
+		SetContext(ctx).
+		SetPathParam("group", group).
+		SetHeader("Accept", "application/json")
+	if authHeader := executor.authHeader(); authHeader != "" {
+		request.SetHeader("Authorization", authHeader)
 	}
-	return compactStrings(indexedFields), nil
+	response, requestErr := request.Get(executor.config.Addr + indexRuleBindingListPath)
+	if requestErr != nil || response.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("index rule binding list unavailable")
+	}
+	listResponse := new(databasev1.IndexRuleBindingRegistryServiceListResponse)
+	if unmarshalErr := protojson.Unmarshal(response.Body(), listResponse); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	return listResponse.GetIndexRuleBinding(), nil
 }
 
 // Execute runs a read-only BYDBQL query through the BanyanDB HTTP gateway.
@@ -457,80 +540,166 @@ func metadataNames(metadataItems []*commonv1.Metadata) []string {
 }
 
 func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (session.SchemaSnapshot, error) {
+	base := session.SchemaSnapshot{
+		UpdatedAt: updatedAt,
+		Type:      req.Type,
+		Name:      req.Name,
+		Groups:    append([]string(nil), req.Groups...),
+	}
 	switch req.Type {
 	case session.ResourceTypeMeasure:
-		measure := new(databasev1.Measure)
-		if unmarshalErr := protojson.Unmarshal(body, measure); unmarshalErr != nil {
-			return session.SchemaSnapshot{}, unmarshalErr
+		measure, parseErr := parseMeasureSchema(body)
+		if parseErr != nil {
+			return session.SchemaSnapshot{}, parseErr
 		}
-		return session.SchemaSnapshot{
-			UpdatedAt: updatedAt,
-			Type:      req.Type,
-			Name:      req.Name,
-			Groups:    append([]string(nil), req.Groups...),
-			Tags:      tagFamilies(measure.GetTagFamilies()),
-			Fields:    fieldNames(measure.GetFields()),
-		}, nil
+		base.Tags = tagFamilies(measure.GetTagFamilies())
+		base.EntityTags = entityTagNames(measure.GetEntity())
+		base.Fields = fieldNames(measure.GetFields())
+		return base, nil
 	case session.ResourceTypeStream:
-		stream := new(databasev1.Stream)
-		if unmarshalErr := protojson.Unmarshal(body, stream); unmarshalErr != nil {
-			return session.SchemaSnapshot{}, unmarshalErr
+		stream, parseErr := parseStreamSchema(body)
+		if parseErr != nil {
+			return session.SchemaSnapshot{}, parseErr
 		}
-		return session.SchemaSnapshot{
-			UpdatedAt: updatedAt,
-			Type:      req.Type,
-			Name:      req.Name,
-			Groups:    append([]string(nil), req.Groups...),
-			Tags:      tagFamilies(stream.GetTagFamilies()),
-		}, nil
+		base.Tags = tagFamilies(stream.GetTagFamilies())
+		base.EntityTags = entityTagNames(stream.GetEntity())
+		return base, nil
 	case session.ResourceTypeTrace:
-		trace := new(databasev1.Trace)
-		if unmarshalErr := protojson.Unmarshal(body, trace); unmarshalErr != nil {
-			return session.SchemaSnapshot{}, unmarshalErr
+		trace, parseErr := parseTraceSchema(body)
+		if parseErr != nil {
+			return session.SchemaSnapshot{}, parseErr
 		}
-		return session.SchemaSnapshot{
-			UpdatedAt: updatedAt,
-			Type:      req.Type,
-			Name:      req.Name,
-			Groups:    append([]string(nil), req.Groups...),
-			Tags:      traceTagNames(trace.GetTags()),
-		}, nil
+		base.Tags = traceTagNames(trace.GetTags())
+		return base, nil
 	case session.ResourceTypeProperty:
-		property := new(databasev1.Property)
-		if unmarshalErr := protojson.Unmarshal(body, property); unmarshalErr != nil {
-			return session.SchemaSnapshot{}, unmarshalErr
+		property, parseErr := parsePropertySchema(body)
+		if parseErr != nil {
+			return session.SchemaSnapshot{}, parseErr
 		}
-		return session.SchemaSnapshot{
-			UpdatedAt: updatedAt,
-			Type:      req.Type,
-			Name:      req.Name,
-			Groups:    append([]string(nil), req.Groups...),
-			Tags:      tagNames(property.GetTags()),
-		}, nil
+		base.Tags = tagNames(property.GetTags())
+		return base, nil
 	case session.ResourceTypeTopN:
-		topN := new(databasev1.TopNAggregation)
-		if unmarshalErr := protojson.Unmarshal(body, topN); unmarshalErr != nil {
-			return session.SchemaSnapshot{}, unmarshalErr
+		topN, parseErr := parseTopNSchema(body)
+		if parseErr != nil {
+			return session.SchemaSnapshot{}, parseErr
 		}
-		return session.SchemaSnapshot{
-			UpdatedAt: updatedAt,
-			Type:      req.Type,
-			Name:      req.Name,
-			Groups:    append([]string(nil), req.Groups...),
-			Tags:      append([]string(nil), topN.GetGroupByTagNames()...),
-			Fields:    compactStrings([]string{topN.GetFieldName()}),
-		}, nil
+		base.Tags = append([]string(nil), topN.GetGroupByTagNames()...)
+		base.Fields = compactStrings([]string{topN.GetFieldName()})
+		return base, nil
 	default:
 		return session.SchemaSnapshot{}, fmt.Errorf("unsupported resource type: %s", req.Type)
 	}
 }
 
+func parseMeasureSchema(body []byte) (*databasev1.Measure, error) {
+	wrapped := new(databasev1.MeasureRegistryServiceGetResponse)
+	if unmarshalErr := protojson.Unmarshal(body, wrapped); unmarshalErr == nil {
+		if measure := wrapped.GetMeasure(); measure != nil {
+			return measure, nil
+		}
+	}
+	measure := new(databasev1.Measure)
+	if unmarshalErr := protojson.Unmarshal(body, measure); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	if measure.GetMetadata() == nil {
+		return nil, fmt.Errorf("measure schema missing in response")
+	}
+	return measure, nil
+}
+
+func parseStreamSchema(body []byte) (*databasev1.Stream, error) {
+	wrapped := new(databasev1.StreamRegistryServiceGetResponse)
+	if unmarshalErr := protojson.Unmarshal(body, wrapped); unmarshalErr == nil {
+		if stream := wrapped.GetStream(); stream != nil {
+			return stream, nil
+		}
+	}
+	stream := new(databasev1.Stream)
+	if unmarshalErr := protojson.Unmarshal(body, stream); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	if stream.GetMetadata() == nil {
+		return nil, fmt.Errorf("stream schema missing in response")
+	}
+	return stream, nil
+}
+
+func parseTraceSchema(body []byte) (*databasev1.Trace, error) {
+	wrapped := new(databasev1.TraceRegistryServiceGetResponse)
+	if unmarshalErr := protojson.Unmarshal(body, wrapped); unmarshalErr == nil {
+		if trace := wrapped.GetTrace(); trace != nil {
+			return trace, nil
+		}
+	}
+	trace := new(databasev1.Trace)
+	if unmarshalErr := protojson.Unmarshal(body, trace); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	if trace.GetMetadata() == nil {
+		return nil, fmt.Errorf("trace schema missing in response")
+	}
+	return trace, nil
+}
+
+func parsePropertySchema(body []byte) (*databasev1.Property, error) {
+	wrapped := new(databasev1.PropertyRegistryServiceGetResponse)
+	if unmarshalErr := protojson.Unmarshal(body, wrapped); unmarshalErr == nil {
+		if property := wrapped.GetProperty(); property != nil {
+			return property, nil
+		}
+	}
+	property := new(databasev1.Property)
+	if unmarshalErr := protojson.Unmarshal(body, property); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	if property.GetMetadata() == nil {
+		return nil, fmt.Errorf("property schema missing in response")
+	}
+	return property, nil
+}
+
+func parseTopNSchema(body []byte) (*databasev1.TopNAggregation, error) {
+	wrapped := new(databasev1.TopNAggregationRegistryServiceGetResponse)
+	if unmarshalErr := protojson.Unmarshal(body, wrapped); unmarshalErr == nil {
+		if topN := wrapped.GetTopNAggregation(); topN != nil {
+			return topN, nil
+		}
+	}
+	topN := new(databasev1.TopNAggregation)
+	if unmarshalErr := protojson.Unmarshal(body, topN); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	if topN.GetMetadata() == nil {
+		return nil, fmt.Errorf("topn schema missing in response")
+	}
+	return topN, nil
+}
+
 func tagFamilies(families []*databasev1.TagFamilySpec) []string {
 	var tags []string
 	for _, family := range families {
-		tags = append(tags, tagNames(family.GetTags())...)
+		familyName := strings.TrimSpace(family.GetName())
+		for _, tag := range family.GetTags() {
+			tagName := strings.TrimSpace(tag.GetName())
+			if tagName == "" {
+				continue
+			}
+			if familyName != "" {
+				tags = append(tags, familyName+"."+tagName)
+				continue
+			}
+			tags = append(tags, tagName)
+		}
 	}
 	return compactStrings(tags)
+}
+
+func entityTagNames(entity *databasev1.Entity) []string {
+	if entity == nil {
+		return nil
+	}
+	return compactStrings(entity.GetTagNames())
 }
 
 func tagNames(tags []*databasev1.TagSpec) []string {

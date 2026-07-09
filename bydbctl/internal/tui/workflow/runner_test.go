@@ -266,6 +266,15 @@ func TestNormalizeFragmentedAgentTextTimeRange(t *testing.T) {
 	}
 }
 
+func TestNormalizeFragmentedAgentTextAggregateAVG(t *testing.T) {
+	input := "SHOW TOP 10 FROM MEASURE latency IN default TIME > '-30m' AGGREGATE BY AV G ORDER BY DESC"
+	want := "SHOW TOP 10 FROM MEASURE latency IN default TIME > '-30m' AGGREGATE BY AVG ORDER BY DESC"
+	got := RepairFragmentedQuery(input)
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestRepairFragmentedQueryAggregateAVG(t *testing.T) {
 	input := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN default TIME > '-30m' AGGREGATE BY AV G ORDER BY DESC"
 	want := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN default TIME > '-30m' AGGREGATE BY AVG ORDER BY DESC"
@@ -360,7 +369,7 @@ func TestReviseWithAgentReportsRawOutputWhenNoCandidate(t *testing.T) {
 	}
 }
 
-func TestReviseWithAgentReportsInvalidCandidateDetails(t *testing.T) {
+func TestReviseWithAgentKeepsInvalidCandidateForNextTurn(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
@@ -369,7 +378,7 @@ func TestReviseWithAgentReportsInvalidCandidateDetails(t *testing.T) {
 			},
 		},
 	}
-	runner := NewRunner(Config{AgentGateway: gateway, MaxRetries: 1})
+	runner := NewRunner(Config{AgentGateway: gateway})
 	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
 		ResourceType: session.ResourceTypeStream,
 		ResourceName: "sw",
@@ -379,15 +388,25 @@ func TestReviseWithAgentReportsInvalidCandidateDetails(t *testing.T) {
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	_, reviseErr := runner.ReviseWithAgent(context.Background(), querySession)
-	if reviseErr == nil {
-		t.Fatal("expected ReviseWithAgent to return error")
+	events, turnErr := runner.RunAgentTurn(context.Background(), querySession, "draft initial query")
+	if turnErr != nil {
+		t.Fatalf("RunAgentTurn returned error: %v", turnErr)
 	}
-	if !strings.Contains(reviseErr.Error(), "last candidate: SELECT * FROM STREAM sw IN default WHERE") {
-		t.Fatalf("expected invalid candidate in error, got: %v", reviseErr)
+	if len(events) == 0 {
+		t.Fatal("expected agent events")
+	}
+	if querySession.Phase != session.PhaseValidate {
+		t.Fatalf("expected validate phase, got %s", querySession.Phase)
 	}
 	if !strings.Contains(querySession.Validation.Message, "syntax error") {
 		t.Fatalf("expected validation detail, got: %s", querySession.Validation.Message)
+	}
+	currentCandidate := querySession.CurrentCandidate()
+	if currentCandidate == nil || currentCandidate.Query == "" {
+		t.Fatal("expected invalid candidate to remain for next turn")
+	}
+	if len(querySession.Conversation) != 1 {
+		t.Fatalf("expected one conversation turn, got %d", len(querySession.Conversation))
 	}
 }
 

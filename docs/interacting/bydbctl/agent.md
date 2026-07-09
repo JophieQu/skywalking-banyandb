@@ -177,18 +177,49 @@ The agent receives the current BYDBQL, validation errors, execution errors, and 
 - `bydbctl` validates and executes BYDBQL only after the user requests it with `Ctrl+E`.
 - ACP permission requests are denied by the bydbctl workflow by default.
 
-## Common Workflows
+## Tabs
 
-Generate from natural language:
+The TUI uses three page tabs (like the web UI separation between metadata, query, and results):
+
+| Tab | Key | Purpose |
+|-----|-----|---------|
+| **Schema** | F1 | Browse groups/resources, inspect tags/fields/indexed columns, select a resource |
+| **Query** | F2 | Goal, turn hints, slots, BYDBQL editor, validation |
+| **Run** | F3 | Execution response, agent activity log (plans, tool calls, errors) |
+
+- `tab` / `shift+tab` cycles focus within the active tab.
+- `[` / `]` switches tabs (except while typing in an input field).
+- After agent turns and execution, the UI switches to **Run** so you can inspect tool calls and HTTP responses.
+
+## Schema Browser (F1)
+
+On startup the TUI loads the BanyanDB schema catalog from `--addr`, similar to the web UI left tree:
+
+- **Left panel**: groups and resources (`M` measure, `S` stream, `T` trace, `P` property, `N` topn)
+- **Filter**: tab to the filter field, or browse with `↑↓` and press `enter` to select a resource
+- **`/`**: cycle resource type filter (ALL → MEASURE → STREAM → …)
+- **`ctrl+l`**: refresh catalog
+- **Selected**: tags, fields, and indexed fields for the highlighted resource
+
+Selecting a resource fills Type, Name, and Groups automatically so you can ask the agent without guessing schema names.
+
+## Multi-turn Agent
+
+Generate from natural language (multi-turn):
 
 ```text
-Fill Goal and Slots -> Ctrl+A -> edit query -> Ctrl+V -> Ctrl+E -> Ctrl+X
+Fill Goal -> Turn hint (optional) -> Ctrl+A -> refine with Turn hint + Ctrl+A -> Ctrl+V -> Ctrl+E -> Ctrl+X
 ```
+
+- **Goal** is the overall question and stays across rounds.
+- **Turn hint** is the per-round instruction to the agent (for example `use sw_metrics group` or `aggregate by AVG`).
+- Each `Ctrl+A` is one agent turn. Invalid candidates stay in the editor; add another Turn hint and press `Ctrl+A` again.
+- The agent session is reused across turns so conversation context is preserved.
 
 Repair an invalid query:
 
 ```text
-Edit query -> Ctrl+V -> Ctrl+A -> Ctrl+V
+Review validation error -> Turn hint with fix instruction -> Ctrl+A -> Ctrl+V
 ```
 
 Revise after seeing results:
@@ -210,15 +241,9 @@ If `Ctrl+A` does not produce a useful query, check these fields first:
 response. The workflow expects exactly one `SELECT` or `SHOW TOP` statement, preferably in a fenced `bydbql` code block. Check the session log
 file shown in `Events` for the full raw agent output.
 
-`error: agent candidate failed validation` means `bydbctl` did extract a candidate, but the BYDBQL parser rejected it after the configured retry
-limit. In this case:
-
-- `BYDBQL Candidate` shows the last invalid query so you can edit it directly.
-- `Validation / Approval` shows the parser or transformer error message.
-- `Events` shows a short validation hint; the session log contains the full validation message and invalid candidate query.
-
-After fixing the editor content, press `Ctrl+V` to validate again. You can also press `Ctrl+A` again; the next agent request includes the current
-candidate and the validation error as repair context.
+`error: agent candidate failed validation` is no longer a hard stop after one turn. When validation fails, the invalid candidate remains in
+`BYDBQL Candidate`, `Validation / Approval` shows the parser error, and you can add a **Turn hint** and press `Ctrl+A` again. The next request
+includes the prior conversation, current candidate, and validation error.
 
 If `--agent codex-acp` fails to start, verify that `npx` is installed and can download `@agentclientprotocol/codex-acp`.
 

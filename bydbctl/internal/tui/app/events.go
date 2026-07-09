@@ -34,6 +34,8 @@ func summarizeAgentEvent(event agent.Event) string {
 	switch event.Kind {
 	case agent.EventKindPlanUpdate:
 		return "agent: planning"
+	case agent.EventKindToolCall:
+		return "tool: " + singleLine(event.Message)
 	case agent.EventKindMessageDelta:
 		return "agent: drafting"
 	case agent.EventKindFinalResponse:

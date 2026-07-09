@@ -105,6 +105,7 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 	prompt.WriteString("- When query_hints.slots_pinned=true, use schema.type, schema.name, and schema.groups exactly.\n")
 	prompt.WriteString("- When query_hints.slots_pinned=false and schema.catalog is present, choose the best matching catalog entry for the goal.\n")
 	prompt.WriteString("- For MEASURE, STREAM, TRACE, and SHOW TOP, include a TIME clause from time_range in the context.\n")
+	prompt.WriteString("- turn_hint is the user's instruction for the current round; apply it on top of goal and prior conversation.\n")
 	if initial {
 		prompt.WriteString("- For exploratory SELECT queries, include LIMIT 10 unless query_hints specify otherwise.\n")
 	} else {
@@ -122,7 +123,8 @@ func writeNLRules(prompt *bytes.Buffer) {
 	prompt.WriteString("- Distinguish time ranges (TIME clause) from data-point limits (LIMIT clause).\n")
 	prompt.WriteString("- template_hint shows a valid baseline query for the current slots; adapt it to the goal.\n")
 	prompt.WriteString("- schema.available_resources lists resource names in the current group when the name slot may be wrong.\n")
-	prompt.WriteString("- schema.catalog lists discoverable resources across groups when the user only provided a goal.\n\n")
+	prompt.WriteString("- schema.catalog lists discoverable resources across groups when the user only provided a goal.\n")
+	prompt.WriteString("- conversation lists prior user hints and agent candidates; continue from the latest state.\n\n")
 }
 
 func writeReferences(prompt *bytes.Buffer) {

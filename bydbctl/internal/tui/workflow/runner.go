@@ -255,6 +255,11 @@ func sameGroups(left, right []string) bool {
 
 // ReviseWithAgent asks the configured agent to revise the current BYDBQL candidate.
 func (runner *Runner) ReviseWithAgent(ctx context.Context, querySession *session.QuerySession) ([]agent.Event, error) {
+	return runner.RunAgentTurn(ctx, querySession, "")
+}
+
+// RunAgentTurn runs one user-facing agent turn with an optional per-round hint.
+func (runner *Runner) RunAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string) ([]agent.Event, error) {
 	if querySession == nil {
 		return nil, errors.New("query session is required")
 	}
@@ -262,74 +267,74 @@ func (runner *Runner) ReviseWithAgent(ctx context.Context, querySession *session
 		return nil, errors.New("agent gateway is not configured")
 	}
 	querySession.Phase = session.PhaseAgentDraft
-	agentSession, startErr := runner.agentGateway.Start(ctx, agent.StartRequest{
-		Provider: "bydbctl-agent",
-		Metadata: map[string]string{
-			"query_session_id": querySession.ID,
-		},
-	})
-	if startErr != nil {
-		querySession.Phase = session.PhaseError
-		return nil, fmt.Errorf("failed to start agent session: %w", startErr)
+	agentSessionID := strings.TrimSpace(querySession.AgentSessionID)
+	if agentSessionID == "" {
+		agentSession, startErr := runner.agentGateway.Start(ctx, agent.StartRequest{
+			Provider: "bydbctl-agent",
+			Metadata: map[string]string{
+				"query_session_id": querySession.ID,
+			},
+		})
+		if startErr != nil {
+			querySession.Phase = session.PhaseError
+			return nil, fmt.Errorf("failed to start agent session: %w", startErr)
+		}
+		agentSessionID = agentSession.ID
+		querySession.AgentSessionID = agentSessionID
 	}
-	var allEvents []agent.Event
+	trimmedTurnHint := strings.TrimSpace(turnHint)
+	if trimmedTurnHint != "" {
+		querySession.AddTranscript("user", trimmedTurnHint, runner.now())
+	}
 	templateHint := BuildTemplateQuery(
 		querySession.ResourceType,
 		querySession.ResourceName,
 		querySession.Groups,
 		querySession.TimeRange,
 	)
-	for attempt := 0; attempt <= runner.maxRetries; attempt++ {
-		hints := ClassifyIntent(querySession)
-		payload := agent.BuildReviseRequest(querySession, hints, templateHint)
-		turnEvents, turnErr := runner.runAgentTurn(ctx, agentSession.ID, payload)
-		allEvents = append(allEvents, turnEvents...)
-		if turnErr != nil {
-			querySession.Phase = session.PhaseError
-			return allEvents, turnErr
-		}
-		candidate := RepairFragmentedQuery(finalCandidate(turnEvents))
-		if strings.TrimSpace(candidate) == "" {
-			querySession.Phase = session.PhaseError
-			outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
-			if outputSummary == "" {
-				return allEvents, errors.New("agent returned no BYDBQL candidate and no readable output")
-			}
-			return allEvents, fmt.Errorf("agent returned no BYDBQL candidate; agent output: %s", outputSummary)
-		}
-		validation, validationErr := runner.validator.Validate(ctx, candidate, &querySession.SchemaSnapshot)
-		if validationErr != nil {
-			querySession.Phase = session.PhaseError
-			return allEvents, fmt.Errorf("failed to validate agent candidate: %w", validationErr)
-		}
-		querySession.AddCandidate(session.BydbqlCandidate{
-			ID:          fmt.Sprintf("candidate-%d", len(querySession.Candidates)+1),
-			Query:       candidate,
-			Explanation: finalExplanation(turnEvents),
-			Source:      session.CandidateSourceAgent,
-			CreatedAt:   runner.now(),
-			Validation:  validation,
-		})
-		querySession.AddTranscript("agent", finalExplanation(turnEvents), runner.now())
-		if validation.Valid {
-			querySession.Phase = session.PhaseReady
-			return allEvents, nil
-		}
+	hints := ClassifyIntent(querySession)
+	payload := agent.BuildAgentTurnRequest(querySession, hints, templateHint, trimmedTurnHint)
+	turnEvents, turnErr := runner.runAgentTurn(ctx, agentSessionID, payload)
+	if turnErr != nil {
+		querySession.Phase = session.PhaseError
+		return turnEvents, turnErr
+	}
+	candidate := RepairFragmentedQuery(finalCandidate(turnEvents))
+	if strings.TrimSpace(candidate) == "" {
 		querySession.Phase = session.PhaseValidate
+		outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
+		if outputSummary == "" {
+			return turnEvents, errors.New("agent returned no BYDBQL candidate and no readable output")
+		}
+		return turnEvents, fmt.Errorf("agent returned no BYDBQL candidate; agent output: %s", outputSummary)
 	}
-	lastCandidate := ""
-	if currentCandidate := querySession.CurrentCandidate(); currentCandidate != nil {
-		lastCandidate = truncateDiagnostic(singleLine(currentCandidate.Query))
+	validation, validationErr := runner.validator.Validate(ctx, candidate, &querySession.SchemaSnapshot)
+	if validationErr != nil {
+		querySession.Phase = session.PhaseError
+		return turnEvents, fmt.Errorf("failed to validate agent candidate: %w", validationErr)
 	}
-	if lastCandidate == "" {
-		return allEvents, fmt.Errorf("agent candidate failed validation after %d retries: %s", runner.maxRetries, querySession.Validation.Message)
+	explanation := finalExplanation(turnEvents)
+	querySession.AddCandidate(session.BydbqlCandidate{
+		ID:          fmt.Sprintf("candidate-%d", len(querySession.Candidates)+1),
+		Query:       candidate,
+		Explanation: explanation,
+		Source:      session.CandidateSourceAgent,
+		CreatedAt:   runner.now(),
+		Validation:  validation,
+	})
+	querySession.AddConversationTurn(session.ConversationTurn{
+		Hint:      trimmedTurnHint,
+		Response:  explanation,
+		Candidate: candidate,
+		CreatedAt: runner.now(),
+	})
+	querySession.AddTranscript("agent", explanation, runner.now())
+	if validation.Valid {
+		querySession.Phase = session.PhaseReady
+		return turnEvents, nil
 	}
-	return allEvents, fmt.Errorf(
-		"agent candidate failed validation after %d retries: %s; last candidate: %s",
-		runner.maxRetries,
-		querySession.Validation.Message,
-		lastCandidate,
-	)
+	querySession.Phase = session.PhaseValidate
+	return turnEvents, nil
 }
 
 // ValidateManualQuery validates an edited BYDBQL query and records it as a manual candidate.
@@ -667,7 +672,22 @@ func shouldJoinIdentifierFragment(left, right string) bool {
 	if strings.HasSuffix(left, "_") || strings.HasPrefix(right, "_") {
 		return true
 	}
+	if len(right) == 1 && isUpperAlpha(right) {
+		switch left + right {
+		case "AVG", "MAX", "MIN":
+			return true
+		}
+	}
 	return isLowerAlpha(left) && isLowerAlpha(right) && len(left) <= 4 && len(right) <= 12
+}
+
+func isUpperAlpha(value string) bool {
+	for _, valueRune := range value {
+		if valueRune < 'A' || valueRune > 'Z' {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func isLowerAlpha(value string) bool {

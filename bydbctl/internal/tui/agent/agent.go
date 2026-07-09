@@ -68,18 +68,27 @@ type TurnRequest struct {
 // AgentTurnRequest is an alias for TurnRequest.
 type AgentTurnRequest = TurnRequest
 
+// ConversationTurnPayload is one prior user-agent exchange exposed to the agent.
+type ConversationTurnPayload struct {
+	Hint      string `json:"hint,omitempty"`
+	Response  string `json:"response,omitempty"`
+	Candidate string `json:"candidate,omitempty"`
+}
+
 // RequestPayload is the JSON shape sent through ACP/Codex adapters.
 type RequestPayload struct {
-	Constraints      Constraints       `json:"constraints"`
-	Schema           SchemaSummary     `json:"schema"`
-	QueryHints       QueryHints        `json:"query_hints"`
-	TimeRange        TimeRangePayload  `json:"time_range"`
-	ExecutionSummary *ExecutionSummary `json:"execution_summary,omitempty"`
-	ValidationError  *string           `json:"validation_error,omitempty"`
-	Task             string            `json:"task"`
-	Goal             string            `json:"goal"`
-	Candidate        string            `json:"candidate"`
-	TemplateHint     string            `json:"template_hint,omitempty"`
+	Constraints      Constraints               `json:"constraints"`
+	Schema           SchemaSummary             `json:"schema"`
+	QueryHints       QueryHints                `json:"query_hints"`
+	TimeRange        TimeRangePayload          `json:"time_range"`
+	ExecutionSummary *ExecutionSummary         `json:"execution_summary,omitempty"`
+	ValidationError  *string                   `json:"validation_error,omitempty"`
+	Conversation     []ConversationTurnPayload `json:"conversation,omitempty"`
+	Task             string                    `json:"task"`
+	Goal             string                    `json:"goal"`
+	TurnHint         string                    `json:"turn_hint,omitempty"`
+	Candidate        string                    `json:"candidate"`
+	TemplateHint     string                    `json:"template_hint,omitempty"`
 }
 
 // Constraints are hard safety constraints owned by bydbctl.
@@ -159,6 +168,7 @@ const (
 	EventKindMessageDelta      EventKind = "message_delta"
 	EventKindPermissionRequest EventKind = "permission_request"
 	EventKindPlanUpdate        EventKind = "plan_update"
+	EventKindToolCall          EventKind = "tool_call"
 	EventKindFinalResponse     EventKind = "final_response"
 	EventKindError             EventKind = "error"
 )
@@ -181,8 +191,27 @@ func (event Event) IsTerminal() bool {
 	return event.Kind == EventKindFinalResponse || event.Kind == EventKindError
 }
 
+// BuildAgentTurnRequest builds the structured request for one user-facing agent turn.
+func BuildAgentTurnRequest(querySession *session.QuerySession, hints QueryHints, templateHint, turnHint string) RequestPayload {
+	payload := buildRequestPayload(querySession, hints, templateHint)
+	payload.TurnHint = strings.TrimSpace(turnHint)
+	payload.Conversation = conversationSummary(querySession.Conversation)
+	if strings.TrimSpace(payload.Candidate) == "" {
+		payload.Task = "draft_bydbql"
+	} else {
+		payload.Task = "revise_bydbql"
+	}
+	return payload
+}
+
 // BuildReviseRequest builds the structured request used by the BYDBQL refinement workflow.
 func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, templateHint string) RequestPayload {
+	payload := buildRequestPayload(querySession, hints, templateHint)
+	payload.Task = "revise_bydbql"
+	return payload
+}
+
+func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, templateHint string) RequestPayload {
 	var candidate string
 	if currentCandidate := querySession.CurrentCandidate(); currentCandidate != nil {
 		candidate = currentCandidate.Query
@@ -205,7 +234,6 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 		}
 	}
 	return RequestPayload{
-		Task:         "revise_bydbql",
 		Goal:         querySession.UserGoal,
 		Candidate:    candidate,
 		TemplateHint: strings.TrimSpace(templateHint),
@@ -235,6 +263,21 @@ func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, te
 		ExecutionSummary: executionSummary,
 		ValidationError:  validationError,
 	}
+}
+
+func conversationSummary(turns []session.ConversationTurn) []ConversationTurnPayload {
+	if len(turns) == 0 {
+		return nil
+	}
+	summary := make([]ConversationTurnPayload, 0, len(turns))
+	for _, turn := range turns {
+		summary = append(summary, ConversationTurnPayload{
+			Hint:      turn.Hint,
+			Response:  turn.Response,
+			Candidate: turn.Candidate,
+		})
+	}
+	return summary
 }
 
 // MarshalPayload renders a structured request for subprocess prompts.

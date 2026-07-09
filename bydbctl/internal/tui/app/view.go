@@ -59,20 +59,59 @@ var (
 
 func (m Model) renderHeader(width int) string {
 	title := titleStyle.Render("bydbctl agent")
-	subtitle := mutedStyle.Render("Editable BYDBQL workbench; WorkflowRunner owns validate, execute, and accept gates")
+	subtitle := mutedStyle.Render("F1 schema · F2 query/agent · F3 run/debug")
 	chips := lipgloss.JoinHorizontal(lipgloss.Top,
 		activeChipStyle.Render("provider "+m.provider),
 		" ",
-		chipStyle.Render("agent read-only"),
-		" ",
-		chipStyle.Render("workflow owns execute"),
+		chipStyle.Render(m.currentPhaseLabel()),
 	)
 	line := lipgloss.JoinHorizontal(lipgloss.Top, title, "  ", chips)
 	return lipgloss.NewStyle().Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, line, subtitle))
 }
 
+func (m Model) currentPhaseLabel() string {
+	if m.querySession == nil {
+		return "phase intent"
+	}
+	return "phase " + m.querySession.Phase.String()
+}
+
+func (m Model) renderQueryTab(width, height int) string {
+	leftWidth := clamp(width*48/100, 40, 80)
+	rightWidth := width - leftWidth - 2
+	queryHeight := clamp(height-14, 10, 24)
+	m.query.SetHeight(queryHeight)
+	left := lipgloss.JoinVertical(lipgloss.Left,
+		m.renderGoal(leftWidth),
+		m.renderTurnHint(leftWidth),
+		m.renderSlots(leftWidth),
+		m.renderStatusLine(leftWidth),
+	)
+	right := lipgloss.JoinVertical(lipgloss.Left,
+		m.renderQuery(rightWidth),
+		m.renderValidation(rightWidth),
+	)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
+}
+
+func (m Model) renderStatusLine(width int) string {
+	status := m.status
+	if m.busy {
+		status = warnStyle.Render(status)
+	}
+	validation := "not checked"
+	if m.querySession != nil && m.querySession.Validation.Message != "" {
+		validation = m.querySession.Validation.Status()
+	}
+	return panelStyle.Width(width).Render(mutedStyle.Render(fmt.Sprintf("Status: %s · Validation: %s", status, validation)))
+}
+
 func (m Model) renderGoal(width int) string {
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("Goal"), m.goal.View()))
+}
+
+func (m Model) renderTurnHint(width int) string {
+	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("Turn hint (Ctrl+A)"), m.turnHint.View()))
 }
 
 func (m Model) renderSlots(width int) string {
@@ -87,35 +126,7 @@ func (m Model) renderSlots(width int) string {
 }
 
 func (m Model) renderWorkflow(width int) string {
-	currentPhase := session.PhaseIntent
-	if m.querySession != nil {
-		currentPhase = m.querySession.Phase
-	}
-	phases := []session.Phase{
-		session.PhaseIntent,
-		session.PhaseAgentDraft,
-		session.PhaseValidate,
-		session.PhaseReady,
-		session.PhaseExecuted,
-		session.PhaseAccepted,
-	}
-	var renderedPhases []string
-	for _, phase := range phases {
-		style := chipStyle
-		if phase == currentPhase {
-			style = activeChipStyle
-		}
-		renderedPhases = append(renderedPhases, style.Render(phase.String()))
-	}
-	status := "Status: " + m.status
-	if m.busy {
-		status = "Status: " + warnStyle.Render(m.status)
-	}
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left,
-		titleStyle.Render("Workflow"),
-		lipgloss.JoinHorizontal(lipgloss.Top, renderedPhases...),
-		status,
-	))
+	return m.renderStatusLine(width)
 }
 
 func (m Model) renderEvents(width int) string {
@@ -183,23 +194,13 @@ func (m Model) renderExecution(width int) string {
 }
 
 func (m Model) renderFooter(width int) string {
-	commands := []string{
-		"tab focus",
-		"ctrl+r type",
-		"ctrl+a agent",
-		"ctrl+v validate",
-		"ctrl+e execute",
-		"ctrl+x accept",
-		"esc quit",
-	}
-	return lipgloss.NewStyle().
-		Width(width).
-		Foreground(mutedColor).
-		Render(strings.Join(commands, "  "))
+	return m.footerForTab(width)
 }
 
 func (m Model) slotRow(label, value string) string {
 	focused := map[int]string{
+		focusCatalogFilter: "Filter",
+		focusTurnHint:      "Turn hint (Ctrl+A)",
 		focusResourceName: "Name",
 		focusGroups:       "Groups",
 		focusStart:        "Start",

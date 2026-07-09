@@ -593,7 +593,7 @@ func normalizeSessionUpdate(params map[string]any) agent.Event {
 		}
 	case "tool_call", "tool_call_update":
 		return agent.Event{
-			Kind:    agent.EventKindPlanUpdate,
+			Kind:    agent.EventKindToolCall,
 			Message: fallbackMessage(toolMessage(update), updateType),
 		}
 	case "available_commands_update":
