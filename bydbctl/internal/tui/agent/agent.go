@@ -138,13 +138,13 @@ type CatalogEntrySummary struct {
 
 // ExecutionSummary is the compact execution feedback exposed to the agent.
 type ExecutionSummary struct {
-	Rows    int    `json:"rows"`
-	Summary string `json:"summary"`
-	Query   string `json:"query"`
-	Command string `json:"command"`
-	Path    string `json:"path"`
-	Error   string `json:"error,omitempty"`
-	Hint    string `json:"hint,omitempty"`
+	Rows         int        `json:"rows"`
+	Columns      []string   `json:"columns,omitempty"`
+	Preview      [][]string `json:"preview,omitempty"`
+	ResourceType string     `json:"resource_type,omitempty"`
+	Duration     string     `json:"duration,omitempty"`
+	Query        string     `json:"query"`
+	Error        string     `json:"error,omitempty"`
 }
 
 // BuildBydbqlPrompt renders the provider prompt for BYDBQL generation.
@@ -169,18 +169,42 @@ const (
 	EventKindPermissionRequest EventKind = "permission_request"
 	EventKindPlanUpdate        EventKind = "plan_update"
 	EventKindToolCall          EventKind = "tool_call"
+	EventKindToolResult        EventKind = "tool_result"
+	EventKindClarification     EventKind = "clarification"
+	EventKindCandidate         EventKind = "candidate"
+	EventKindApproval          EventKind = "approval"
+	EventKindCancelled         EventKind = "cancelled"
 	EventKindFinalResponse     EventKind = "final_response"
 	EventKindError             EventKind = "error"
 )
 
+// EventStatus describes the lifecycle state of a visible agent action.
+type EventStatus string
+
+// Event lifecycle statuses.
+const (
+	EventStatusWaiting   EventStatus = "waiting"
+	EventStatusRunning   EventStatus = "running"
+	EventStatusSucceeded EventStatus = "succeeded"
+	EventStatusFailed    EventStatus = "failed"
+	EventStatusCancelled EventStatus = "cancelled"
+)
+
 // Event is the provider-neutral stream item consumed by WorkflowRunner and the TUI.
 type Event struct {
-	Kind        EventKind
-	Message     string
-	Candidate   string
-	Explanation string
-	Permission  string
-	Err         error
+	StartedAt     time.Time
+	CompletedAt   time.Time
+	ID            string
+	Kind          EventKind
+	Message       string
+	Candidate     string
+	Explanation   string
+	Permission    string
+	ToolName      string
+	InputSummary  string
+	OutputSummary string
+	Status        EventStatus
+	Err           error
 }
 
 // AgentEvent is an alias for Event.
@@ -222,15 +246,15 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 		validationError = &message
 	}
 	var executionSummary *ExecutionSummary
-	if querySession.ExecutionResult.Summary != "" || querySession.ExecutionResult.Error != "" || querySession.ExecutionResult.Hint != "" {
+	if querySession.ExecutionResult.Query != "" || querySession.ExecutionResult.Error != "" {
 		executionSummary = &ExecutionSummary{
-			Rows:    querySession.ExecutionResult.Rows,
-			Summary: querySession.ExecutionResult.Summary,
-			Query:   querySession.ExecutionResult.Query,
-			Command: querySession.ExecutionResult.Command,
-			Path:    querySession.ExecutionResult.Path,
-			Error:   querySession.ExecutionResult.Error,
-			Hint:    querySession.ExecutionResult.Hint,
+			Rows:         querySession.ExecutionResult.Rows,
+			Columns:      append([]string(nil), querySession.ExecutionResult.Columns...),
+			Preview:      previewForProvider(querySession.IncludePreview, querySession.ExecutionResult.Preview),
+			ResourceType: querySession.ExecutionResult.ResourceType,
+			Duration:     querySession.ExecutionResult.Duration.String(),
+			Query:        querySession.ExecutionResult.Query,
+			Error:        providerExecutionError(querySession.ExecutionResult.Error),
 		}
 	}
 	return RequestPayload{
@@ -247,7 +271,7 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 			ReadOnly:                           true,
 			MustUseSchema:                      true,
 			UserMustEditOrConfirmBeforeExecute: true,
-			MustNotExecuteTools:                true,
+			MustNotExecuteTools:                false,
 		},
 		Schema: SchemaSummary{
 			Type:               querySession.SchemaSnapshot.Type.String(),
@@ -263,6 +287,30 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 		ExecutionSummary: executionSummary,
 		ValidationError:  validationError,
 	}
+}
+
+func providerExecutionError(executionError string) string {
+	if strings.TrimSpace(executionError) == "" {
+		return ""
+	}
+	return "BYDBQL execution failed"
+}
+
+const maxProviderPreviewRows = 10
+
+func previewForProvider(includePreview bool, preview [][]string) [][]string {
+	if !includePreview || len(preview) == 0 {
+		return nil
+	}
+	previewLength := len(preview)
+	if previewLength > maxProviderPreviewRows {
+		previewLength = maxProviderPreviewRows
+	}
+	sharedPreview := make([][]string, 0, previewLength)
+	for _, row := range preview[:previewLength] {
+		sharedPreview = append(sharedPreview, append([]string(nil), row...))
+	}
+	return sharedPreview
 }
 
 func conversationSummary(turns []session.ConversationTurn) []ConversationTurnPayload {

@@ -1,13 +1,10 @@
 # BYDBQL Agent TUI
 
-`bydbctl agent` opens an interactive TUI for building, editing, validating, executing, and accepting BYDBQL queries.
+`bydbctl agent` is a three-page terminal workspace for discovering BanyanDB schemas, drafting BYDBQL with an ACP agent, and safely running approved queries.
 
-The agent can generate and revise BYDBQL, but it does not execute shell commands or query BanyanDB directly. `bydbctl` owns schema discovery,
-validation, execution, and final acceptance.
+The default provider is `codex-acp`. It starts `@agentclientprotocol/codex-acp` through `npx`; a different ACP-compatible stdio command can be selected with `--agent acp --acp-command …`.
 
-## Start the TUI
-
-Use the built-in deterministic demo agent:
+## Start
 
 ```shell
 bydbctl agent \
@@ -18,118 +15,7 @@ bydbctl agent \
   --name service_endpoint_latency
 ```
 
-Use Codex through `codex exec`:
-
-```shell
-bydbctl agent \
-  --agent codex-exec \
-  --addr http://localhost:17913 \
-  --goal "top slow payment endpoints in the last 30 minutes" \
-  --groups sw_metrics \
-  --resource-type MEASURE \
-  --name service_endpoint_latency
-```
-
-Use Codex through `agentclientprotocol/codex-acp`:
-
-```shell
-bydbctl agent \
-  --agent codex-acp \
-  --mcp-config .mcp.json \
-  --addr http://localhost:17913 \
-  --goal "top slow payment endpoints in the last 30 minutes" \
-  --groups sw_metrics \
-  --resource-type MEASURE \
-  --name service_endpoint_latency
-```
-
-`--agent codex-acp` starts this ACP server internally:
-
-```shell
-npx -y @agentclientprotocol/codex-acp
-```
-
-For Codex ACP with BanyanDB MCP tools, build the MCP server artifacts first:
-
-```shell
-make -C mcp build
-make -C mcp build:validator
-```
-
-`--mcp-config .mcp.json` passes the configured BanyanDB MCP server to the ACP session. The default is empty because some ACP servers reject
-`mcpServers` in `session/new`. Pass the flag only when your ACP adapter supports MCP server injection.
-
-The BanyanDB MCP server exposes tools such as `list_groups_schemas`, `validate_bydbql`, and `list_resources_bydbql`. Codex can use those read-only
-tools while drafting or checking a query. The final TUI flow still writes the BYDBQL into the editor, and `Ctrl+E` remains the bydbctl-owned execution
-gate shown in `Execution Preview`.
-
-You can also pass a custom ACP-compatible command:
-
-```shell
-bydbctl agent \
-  --agent acp \
-  --acp-command npx \
-  --acp-arg -y \
-  --acp-arg @agentclientprotocol/codex-acp
-```
-
-## Screen Layout
-
-The left side contains:
-
-- `Goal`: the natural language question for the agent.
-- `Slots`: resource type, resource name, groups, and time range.
-- `Workflow`: the current workflow phase.
-- `Events`: short workflow hints; full details are written to a session log file shown at the bottom of the panel.
-
-Each `bydbctl agent` run writes a timestamped log under `$HOME/.bydbctl/logs/agent-YYYYMMDD-HHMMSS.log`. Override the directory with `--log-dir`. When the TUI exits, the full log path is printed to stderr.
-
-The right side contains:
-
-- `BYDBQL Candidate`: the editable query editor.
-- `Validation / Approval`: validation status and accepted query state.
-- `Execution Preview`: the executed HTTP command, response path, row count, and response summary.
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `Tab` | Move focus to the next input or editor. |
-| `Shift+Tab` | Move focus to the previous input or editor. |
-| `Ctrl+R` | Cycle resource type: `MEASURE`, `STREAM`, `TRACE`, `PROPERTY`, `TOPN`. |
-| `Ctrl+A` | Ask the configured agent to generate or revise BYDBQL. |
-| `Ctrl+V` | Validate the current BYDBQL editor content. |
-| `Ctrl+E` | Execute the current valid BYDBQL query through the workflow-owned query endpoint. |
-| `Ctrl+X` | Accept the current executed BYDBQL as the final query. |
-| `Esc` or `Ctrl+C` | Quit. |
-
-## Generate BYDBQL with the Agent
-
-1. Start `bydbctl agent`.
-2. Use `Tab` to focus `Goal`.
-3. Enter a natural language request, for example:
-
-```text
-Show the top 10 slow endpoints of payment-service in the last 30 minutes.
-```
-
-4. Fill the slots:
-
-```text
-Type: MEASURE
-Name: service_endpoint_latency
-Groups: sw_metrics
-Start: -30m
-End:
-```
-
-5. Press `Ctrl+A`.
-
-The TUI sends the goal, slots, schema summary (including indexed fields for ORDER BY), time range, query hints, a template baseline query, current BYDBQL candidate, validation errors, and execution errors to the configured agent. The agent returns a BYDBQL candidate. The candidate is written into the `BYDBQL Candidate` editor.
-
-With `--addr` set, bydbctl discovers groups, resource catalogs, schema details, and index rules directly from BanyanDB HTTP APIs before each workflow action. If you only provide a goal, bydbctl auto-matches the best resource from `schema.catalog` and fills the Slots for you. Explicit Name and Groups values pin the slots and override catalog matching. MCP is optional and not required for standalone use.
-
-Goal-only example:
+For a custom ACP provider:
 
 ```shell
 bydbctl agent \
@@ -137,117 +23,74 @@ bydbctl agent \
   --acp-command npx \
   --acp-arg -y \
   --acp-arg @agentclientprotocol/claude-agent-acp \
-  --addr http://localhost:17913 \
-  --goal "top 10 slow payment endpoints in last 30 minutes"
+  --addr https://banyandb.example:17913 \
+  --enable-tls \
+  --cert /path/to/ca.pem
 ```
 
-bydbctl lists groups from `/api/v1/group/schema/lists`, lists resources per group, scores catalog entries against the goal, and sends the matched schema plus full catalog to the agent.
+The Agent TUI uses the same `--addr`, username/password, TLS certificate, and `--insecure` semantics as the normal bydbctl HTTP commands. The external provider never receives those settings or BanyanDB credentials.
 
-## Edit, Validate, Execute, and Accept
+## Controlled tools and safety
 
-After the agent generates a query:
+Each TUI session creates a private, local MCP bridge. It exposes exactly these tools:
 
-1. Edit the `BYDBQL Candidate` text directly if needed.
-2. Press `Ctrl+V` to validate the current editor content.
-3. Press `Ctrl+E` to execute it after validation passes.
-4. Check `Execution Preview` for:
-   - command: `POST /api/v1/bydbql/query`
-   - response path
-   - row count
-   - response summary
-5. Press `Ctrl+X` to accept the final BYDBQL.
+- `list_groups_schemas`
+- `describe_schema`
+- `validate_bydbql`
+- `execute_bydbql`
 
-`Ctrl+X` only accepts the current candidate after it has been executed. If you edit the query after execution, execute it again before accepting.
+Schema discovery and validation can run automatically. The bridge rejects every other tool, shell command, external MCP server, dynamic registration, and download. The legacy `--mcp-config` option is retained only to produce an explicit error; external MCP injection is not supported. The old `codex-exec` provider is removed. The deterministic `fake` provider is test-only and is not a CLI provider.
 
-## Revise Again After Execution
+An agent must publish a candidate through the structured `validate_bydbql` tool call. bydbctl deliberately does not extract a statement from Markdown, JSON, or free-form provider text.
 
-You can continue after execution:
+## Execution approval
 
-1. Edit the BYDBQL manually, or leave the executed query as-is.
-2. Press `Ctrl+A`.
+No query runs merely because the agent generated it. `execute_bydbql` and the manual `Ctrl+E` path create an approval card containing the exact BYDBQL statement, resource, groups, time range, and limit.
 
-The agent receives the current BYDBQL, validation errors, execution errors, and zero-row hints from the last `Ctrl+E` run. This lets it revise the query based on syntax, semantic checks (such as unknown tags/fields or non-indexed ORDER BY fields), or BanyanDB execution failures.
+- `y` approves that exact statement for one request.
+- `n` rejects it.
+- `e` rejects it, stops the active turn, and copies the statement into the editor for revision.
 
-## Safety Rules
+Any changed statement requires a new approval. The card also shows the effective query timeout and local preview bound. Configure these with `--query-timeout` and `--preview-rows`. Immediately after approval, bydbctl validates the exact statement again; failed revalidation prevents execution. Queries are never retried automatically. `Esc` or `Ctrl+C` stops an active agent/query operation, rejects pending approvals, and retains the activity and candidate history.
 
-- The agent only proposes BYDBQL.
-- The BYDBQL editor is always editable before execution.
-- The agent cannot accept a final query.
-- The agent cannot execute BanyanDB queries directly.
-- `bydbctl` validates and executes BYDBQL only after the user requests it with `Ctrl+E`.
-- ACP permission requests are denied by the bydbctl workflow by default.
+The local semantic checks require a `TIME` clause for time-series queries and a `LIMIT` for `SELECT` queries. These checks complement BanyanDB execution and do not grant the provider permission to access data.
 
-## Tabs
+## Pages and controls
 
-The TUI uses three page tabs (like the web UI separation between metadata, query, and results):
+| Page | Key | Purpose |
+| --- | --- | --- |
+| Schema | F1 | Browse groups and resources, inspect tags/fields/indexes, select a resource |
+| Query / Agent | F2 | Multi-turn conversation, current BYDBQL version, validation and approval |
+| Run / Activity | F3 | Structured result preview and live plan/tool/approval/execution activity |
 
-| Tab | Key | Purpose |
-|-----|-----|---------|
-| **Schema** | F1 | Browse groups/resources, inspect tags/fields/indexed columns, select a resource |
-| **Query** | F2 | Goal, turn hints, slots, BYDBQL editor, validation |
-| **Run** | F3 | Execution response, agent activity log (plans, tool calls, errors) |
+On the Query page:
 
-- `tab` / `shift+tab` cycles focus within the active tab.
-- `[` / `]` switches tabs (except while typing in an input field).
-- After agent turns and execution, the UI switches to **Run** so you can inspect tool calls and HTTP responses.
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+A` | Send the overall goal plus the optional next instruction to the ACP agent |
+| `Ctrl+V` | Validate the current editor content immediately |
+| `Ctrl+E` | Request one-time execution approval for the current valid content |
+| `Ctrl+←` / `Ctrl+→` | Select a previous or next BYDBQL candidate version |
+| `Tab` / `Shift+Tab` | Change focus |
+| `Esc` / `Ctrl+C` | Stop active work; quit when idle |
 
-## Schema Browser (F1)
+Editing the query creates a manual candidate. The editor performs a short debounced local validation but never invokes the agent or runs a query automatically. Agent and manual candidates are versioned independently; a later agent turn starts from the selected version.
 
-On startup the TUI loads the BanyanDB schema catalog from `--addr`, similar to the web UI left tree:
+## Results and data sharing
 
-- **Left panel**: groups and resources (`M` measure, `S` stream, `T` trace, `P` property, `N` topn)
-- **Filter**: tab to the filter field, or browse with `↑↓` and press `enter` to select a resource
-- **`/`**: cycle resource type filter (ALL → MEASURE → STREAM → …)
-- **`ctrl+l`**: refresh catalog
-- **Selected**: tags, fields, and indexed fields for the highlighted resource
+The Run page shows resource type, duration, row count, and a bounded structured table preview. The raw HTTP response remains available only in the current process as a detail view. It is neither sent to the ACP provider nor written to the normal session log.
 
-Selecting a resource fills Type, Name, and Groups automatically so you can ask the agent without guessing schema names.
+When a user asks a later question, bydbctl supplies the provider only the current statement, result type, row count, duration, column summary, and error. It does not automatically trigger a follow-up agent turn after execution. Press `Ctrl+P` to explicitly attach a bounded subset of the current table preview to the next agent turn; press it again to turn sharing off.
 
-## Multi-turn Agent
+## Activity log and persistence
 
-Generate from natural language (multi-turn):
+The activity log shows user-visible plans, tool lifecycle states, approval decisions, validation, cancellation, and execution summaries. It never displays model internal reasoning.
 
-```text
-Fill Goal -> Turn hint (optional) -> Ctrl+A -> refine with Turn hint + Ctrl+A -> Ctrl+V -> Ctrl+E -> Ctrl+X
-```
-
-- **Goal** is the overall question and stays across rounds.
-- **Turn hint** is the per-round instruction to the agent (for example `use sw_metrics group` or `aggregate by AVG`).
-- Each `Ctrl+A` is one agent turn. Invalid candidates stay in the editor; add another Turn hint and press `Ctrl+A` again.
-- The agent session is reused across turns so conversation context is preserved.
-
-Repair an invalid query:
-
-```text
-Review validation error -> Turn hint with fix instruction -> Ctrl+A -> Ctrl+V
-```
-
-Revise after seeing results:
-
-```text
-Ctrl+E -> review Execution Preview -> Ctrl+A -> Ctrl+V -> Ctrl+E
-```
+Session logs are stored in `$HOME/.bydbctl/logs` by default (override with `--log-dir`) with owner-only file permissions. They contain audit summaries: user actions, candidate statements, tool/approval summaries, durations, row counts, and errors. Raw result rows and long provider responses stay in memory and are not persisted. Sessions end when the TUI exits; cross-process recovery is not implemented.
 
 ## Troubleshooting
 
-If `Ctrl+A` does not produce a useful query, check these fields first:
-
-- `Name` must be the BanyanDB resource name.
-- `Groups` must include the resource group.
-- `Type` must match the resource type.
-- `Start` should be set for measure, stream, trace, and Top-N queries.
-
-`error: agent returned no BYDBQL candidate` means the agent finished a turn, but `bydbctl` could not find a usable BYDBQL statement in the
-response. The workflow expects exactly one `SELECT` or `SHOW TOP` statement, preferably in a fenced `bydbql` code block. Check the session log
-file shown in `Events` for the full raw agent output.
-
-`error: agent candidate failed validation` is no longer a hard stop after one turn. When validation fails, the invalid candidate remains in
-`BYDBQL Candidate`, `Validation / Approval` shows the parser error, and you can add a **Turn hint** and press `Ctrl+A` again. The next request
-includes the prior conversation, current candidate, and validation error.
-
-If `--agent codex-acp` fails to start, verify that `npx` is installed and can download `@agentclientprotocol/codex-acp`.
-
-If Codex ACP starts but cannot use BanyanDB tools, verify `--mcp-config`, `mcp/dist/index.js`, `mcp/tools/bin/bydbql-parse`, and the `BANYANDB_ADDRESS`
-inside `.mcp.json`.
-
-If execution fails, check `--addr`, `--username`, and `--password`, then open the session log from `Events` for the HTTP status, error summary, and full agent transcript.
+- If ACP cannot start, check the selected ACP command and its local login/runtime prerequisites. `codex-acp` requires `npx` and the Codex ACP package.
+- If schema discovery fails, verify the normal bydbctl address, authentication, TLS, certificate, and server permissions.
+- If no candidate appears, inspect the Activity page. The provider must call `validate_bydbql`; a statement embedded in chat text is intentionally ignored.
+- If an approval fails after `y`, review the local revalidation error, update the query, and request approval again.

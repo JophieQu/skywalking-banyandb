@@ -67,7 +67,10 @@ func (m Model) footerForTab(width int) string {
 	case tabSchema:
 		commands = []string{"f1-f3 or [ ] tabs", "↑↓ browse", "enter select", "/ type", "ctrl+l refresh", "tab focus", "esc quit"}
 	case tabQuery:
-		commands = []string{"f1-f3 or [ ] tabs", "ctrl+a agent", "ctrl+v validate", "ctrl+e execute", "ctrl+x accept", "tab focus", "esc quit"}
+		commands = []string{
+			"f1-f3 or [ ] tabs", "ctrl+a agent", "ctrl+v validate", "ctrl+e request execution", "ctrl+p share preview",
+			"ctrl+←/→ versions", "y/n/e approval", "tab focus", "esc stop/quit",
+		}
 	default:
 		commands = []string{"f1-f3 or [ ] tabs", "↑↓ scroll activity", "pgup/pgdn", "tab focus", "esc quit"}
 	}

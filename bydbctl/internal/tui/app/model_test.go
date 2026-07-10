@@ -77,9 +77,12 @@ func TestUpdateSyncsSessionAndEventsBeforeError(t *testing.T) {
 		t.Fatalf("failed to read session log: %v", readErr)
 	}
 	logContent := string(logBytes)
-	for _, expected := range []string{"agent raw output", "syntax error: expected expression", "agent candidate failed validation"} {
+	for _, expected := range []string{"syntax error: expected expression", "agent candidate failed validation"} {
 		if !strings.Contains(logContent, expected) {
 			t.Fatalf("expected log to contain %q:\n%s", expected, logContent)
 		}
+	}
+	if strings.Contains(logContent, "agent raw output") {
+		t.Fatalf("provider output must not be persisted by default:\n%s", logContent)
 	}
 }

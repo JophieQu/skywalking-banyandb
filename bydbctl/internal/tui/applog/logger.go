@@ -50,11 +50,11 @@ func New(dir string) (*Logger, error) {
 			logDir = filepath.Join(homeDir, defaultLogDirName)
 		}
 	}
-	if mkdirErr := os.MkdirAll(logDir, 0o755); mkdirErr != nil {
+	if mkdirErr := os.MkdirAll(logDir, 0o700); mkdirErr != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", mkdirErr)
 	}
 	logPath := filepath.Join(logDir, fmt.Sprintf("agent-%s.log", time.Now().Format("20060102-150405")))
-	logFile, openErr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, openErr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if openErr != nil {
 		return nil, fmt.Errorf("failed to open log file: %w", openErr)
 	}
@@ -115,7 +115,7 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 	}
 	deltaCount := 0
 	var otherKinds []string
-	var finalMessage, candidate, explanation string
+	var candidate string
 	var agentErr error
 	for _, event := range events {
 		switch event.Kind {
@@ -124,14 +124,8 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 				deltaCount++
 			}
 		case agent.EventKindFinalResponse:
-			if strings.TrimSpace(event.Message) != "" {
-				finalMessage = event.Message
-			}
 			if strings.TrimSpace(event.Candidate) != "" {
 				candidate = event.Candidate
-			}
-			if strings.TrimSpace(event.Explanation) != "" {
-				explanation = event.Explanation
 			}
 		case agent.EventKindError:
 			if event.Err != nil {
@@ -150,21 +144,6 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 	}
 	if candidate != "" {
 		parts = append(parts, "candidate="+truncateLogField(candidate))
-	}
-	if explanation != "" {
-		parts = append(parts, "explanation="+truncateLogField(explanation))
-	}
-	if finalMessage != "" && candidate == "" {
-		parts = append(parts, "message="+truncateLogField(finalMessage))
-	}
-	if candidate == "" && finalMessage == "" && deltaCount > 0 {
-		var deltaMessages []string
-		for _, event := range events {
-			if event.Kind == agent.EventKindMessageDelta && strings.TrimSpace(event.Message) != "" {
-				deltaMessages = append(deltaMessages, event.Message)
-			}
-		}
-		parts = append(parts, "message="+truncateLogField(strings.Join(deltaMessages, "")))
 	}
 	if agentErr != nil {
 		parts = append(parts, "error="+agentErr.Error())
@@ -201,12 +180,15 @@ func (sessionLogger *Logger) WriteQuerySession(querySession *session.QuerySessio
 	if querySession.ExecutionResult.Summary != "" || querySession.ExecutionResult.Error != "" || querySession.ExecutionResult.Hint != "" {
 		executionResult := querySession.ExecutionResult
 		sessionLogger.Write("execution", fmt.Sprintf(
-			"rows=%d summary=%q error=%q hint=%q response=%s",
+			"resource_type=%s duration=%s rows=%d preview_rows=%d truncated=%t summary=%q error=%q hint=%q",
+			executionResult.ResourceType,
+			executionResult.Duration,
 			executionResult.Rows,
+			len(executionResult.Preview),
+			executionResult.Truncated,
 			executionResult.Summary,
 			executionResult.Error,
 			executionResult.Hint,
-			executionResult.Response,
 		))
 	}
 }

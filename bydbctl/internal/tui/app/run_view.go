@@ -46,6 +46,8 @@ func (m Model) renderExecutionDetail(width int) string {
 	}
 	rows = append(rows,
 		fmt.Sprintf("Phase: %s", phase),
+		"Resource type: "+fallback(executionResult.ResourceType, "-"),
+		"Duration: "+executionResult.Duration.String(),
 		"Command: "+fallback(executionResult.Command, "-"),
 		"Path: "+fallback(executionResult.Path, "-"),
 		fmt.Sprintf("Rows: %d", executionResult.Rows),
@@ -57,8 +59,18 @@ func (m Model) renderExecutionDetail(width int) string {
 	if executionResult.Hint != "" {
 		rows = append(rows, warnStyle.Render("Hint: "+executionResult.Hint))
 	}
+	if len(executionResult.Columns) > 0 {
+		rows = append(rows, titleStyle.Render("Table preview"))
+		rows = append(rows, strings.Join(executionResult.Columns, " | "))
+		for _, previewRow := range executionResult.Preview {
+			rows = append(rows, truncate(strings.Join(previewRow, " | "), width-4))
+		}
+		if executionResult.Truncated {
+			rows = append(rows, warnStyle.Render("preview truncated; open raw response below only when needed"))
+		}
+	}
 	if executionResult.Response != "" {
-		rows = append(rows, titleStyle.Render("Response"))
+		rows = append(rows, titleStyle.Render("Raw response (current process only)"))
 		rows = append(rows, mutedStyle.Render(wrapText(executionResult.Response, width-4)))
 	}
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))

@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	maxVisibleEvents   = 4
-	maxUIEventRunes    = 72
-	maxUIErrorRunes    = 88
+	maxVisibleEvents = 4
+	maxUIEventRunes  = 72
+	maxUIErrorRunes  = 88
 )
 
 func summarizeAgentEvent(event agent.Event) string {
@@ -35,7 +35,17 @@ func summarizeAgentEvent(event agent.Event) string {
 	case agent.EventKindPlanUpdate:
 		return "agent: planning"
 	case agent.EventKindToolCall:
-		return "tool: " + singleLine(event.Message)
+		return "tool: " + fallback(event.ToolName, singleLine(event.Message))
+	case agent.EventKindToolResult:
+		return "tool complete: " + fallback(event.ToolName, singleLine(event.Message))
+	case agent.EventKindCandidate:
+		return "agent: validated BYDBQL candidate ready"
+	case agent.EventKindClarification:
+		return "agent question: " + singleLine(event.Message)
+	case agent.EventKindApproval:
+		return "execution approval required"
+	case agent.EventKindCancelled:
+		return "agent action cancelled"
 	case agent.EventKindMessageDelta:
 		return "agent: drafting"
 	case agent.EventKindFinalResponse:

@@ -30,6 +30,7 @@ import (
 
 var (
 	timeClausePattern    = regexp.MustCompile(`(?i)\bTIME\b`)
+	limitClausePattern   = regexp.MustCompile(`(?i)\bLIMIT\s+\d+\b`)
 	orderByFieldPattern  = regexp.MustCompile(`(?i)\bORDER\s+BY\s+([A-Za-z_][\w.]*)`)
 	topNOrderOnlyPattern = regexp.MustCompile(`(?i)\bORDER\s+BY\s+(ASC|DESC)\s*$`)
 )
@@ -66,6 +67,9 @@ func (validator *SemanticValidator) semanticMessage(query string, schema *sessio
 	if requiresTimeClause(query) && !timeClausePattern.MatchString(query) {
 		return "TIME clause is required for MEASURE, STREAM, TRACE, and SHOW TOP queries"
 	}
+	if requiresLimitClause(query) && !limitClausePattern.MatchString(query) {
+		return "LIMIT clause is required for SELECT queries"
+	}
 	if orderField := extractOrderByField(query); orderField != "" && len(schema.IndexedFields) > 0 {
 		if !containsIndexedField(schema.IndexedFields, orderField) {
 			if suggestion := suggestIndexedField(schema.IndexedFields, orderField); suggestion != "" {
@@ -78,6 +82,11 @@ func (validator *SemanticValidator) semanticMessage(query string, schema *sessio
 		return identifierMessage
 	}
 	return ""
+}
+
+func requiresLimitClause(query string) bool {
+	grammar, parseErr := corebydbql.ParseQuery(query)
+	return parseErr == nil && grammar != nil && grammar.Select != nil
 }
 
 func requiresTimeClause(query string) bool {

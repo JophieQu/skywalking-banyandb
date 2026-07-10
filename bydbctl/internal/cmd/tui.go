@@ -18,10 +18,9 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -29,24 +28,22 @@ import (
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/acp"
-	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/codex"
-	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
-	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
 	tuiapp "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/app"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
+	tuibysql "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bydbql"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 	"github.com/apache/skywalking-banyandb/pkg/version"
 )
 
 const (
-	agentProviderFake      = "fake"
-	agentProviderCodexExec = "codex-exec"
-	agentProviderACP       = "acp"
-	agentProviderCodexACP  = "codex-acp"
+	agentProviderACP      = "acp"
+	agentProviderCodexACP = "codex-acp"
 )
 
 func newAgentCmd() *cobra.Command {
 	var agentProvider string
-	var codexBin string
 	var acpCommand string
 	var acpArgs []string
 	var mcpConfig string
@@ -56,13 +53,17 @@ func newAgentCmd() *cobra.Command {
 	var initialGroups string
 	var initialStart string
 	var initialEnd string
-	var maxRetries int
+	var queryTimeout time.Duration
+	var previewRows int
 	var logDir string
 	agentCmd := &cobra.Command{
 		Use:     "agent",
 		Version: version.Build(),
 		Short:   "Open the interactive BYDBQL agent TUI",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if cmd.Flags().Changed("mcp-config") {
+				return fmt.Errorf("--mcp-config is no longer supported: bydbctl agent only exposes its built-in controlled tools")
+			}
 			if initialGroups == "" {
 				initialGroups = viper.GetString("group")
 			}
@@ -70,7 +71,34 @@ func newAgentCmd() *cobra.Command {
 			if wdErr != nil {
 				return fmt.Errorf("failed to get working directory: %w", wdErr)
 			}
-			agentGateway, gatewayErr := newAgentGateway(agentProvider, codexBin, acpCommand, acpArgs, mcpConfig, workingDirectory)
+			executor := tools.NewHTTPExecutor(tools.HTTPConfig{
+				Addr:           viper.GetString("addr"),
+				Username:       viper.GetString("username"),
+				Password:       viper.GetString("password"),
+				EnableTLS:      enableTLS,
+				Insecure:       insecure,
+				Cert:           cert,
+				Timeout:        queryTimeout,
+				MaxPreviewRows: previewRows,
+			})
+			approvals := approval.NewController()
+			toolBridge := bridge.New(bridge.Config{
+				Approvals: approvals,
+				Executor:  executor,
+				Validator: tuibysql.NewSemanticValidator(),
+			})
+			bridgeServer, bridgeErr := bridge.StartSocketServer(toolBridge)
+			if bridgeErr != nil {
+				return fmt.Errorf("failed to start controlled tool bridge: %w", bridgeErr)
+			}
+			defer func() {
+				_ = bridgeServer.Close()
+			}()
+			executable, executableErr := os.Executable()
+			if executableErr != nil {
+				return fmt.Errorf("failed to locate bydbctl executable: %w", executableErr)
+			}
+			agentGateway, gatewayErr := newAgentGateway(agentProvider, acpCommand, acpArgs, workingDirectory, bridgeServer.MCPServerConfig(executable))
 			if gatewayErr != nil {
 				return gatewayErr
 			}
@@ -82,12 +110,10 @@ func newAgentCmd() *cobra.Command {
 				_ = sessionLog.Close()
 			}()
 			model := tuiapp.NewModel(tuiapp.Config{
-				AgentGateway: agentGateway,
-				Executor: tools.NewHTTPExecutor(tools.HTTPConfig{
-					Addr:     viper.GetString("addr"),
-					Username: viper.GetString("username"),
-					Password: viper.GetString("password"),
-				}),
+				AgentGateway:   agentGateway,
+				Executor:       executor,
+				Approvals:      approvals,
+				ToolBridge:     toolBridge,
 				SessionLog:     sessionLog,
 				Provider:       agentProvider,
 				Goal:           initialGoal,
@@ -96,7 +122,6 @@ func newAgentCmd() *cobra.Command {
 				Groups:         initialGroups,
 				Start:          initialStart,
 				End:            initialEnd,
-				MaxRetries:     maxRetries,
 				NameProvided:   initialResourceName != "",
 				GroupsProvided: initialGroups != "",
 				TypeProvided:   cmd.Flags().Changed("resource-type"),
@@ -109,96 +134,48 @@ func newAgentCmd() *cobra.Command {
 			return nil
 		},
 	}
-	agentCmd.Flags().StringVar(&agentProvider, "agent", agentProviderFake, "agent adapter: fake, codex-exec, acp, or codex-acp")
-	agentCmd.Flags().StringVar(&codexBin, "codex-bin", "codex", "codex executable used by --agent codex-exec")
+	agentCmd.Flags().StringVar(&agentProvider, "agent", agentProviderCodexACP, "ACP-compatible agent adapter: codex-acp or acp")
 	agentCmd.Flags().StringVar(&acpCommand, "acp-command", "", "ACP-compatible stdio command used by --agent acp")
 	agentCmd.Flags().StringArrayVar(&acpArgs, "acp-arg", nil, "argument passed to --acp-command; may be repeated")
-	agentCmd.Flags().StringVar(&mcpConfig, "mcp-config", "", "MCP config file passed to ACP agents; empty disables MCP injection")
+	agentCmd.Flags().StringVar(&mcpConfig, "mcp-config", "", "deprecated: external MCP configuration is rejected")
 	agentCmd.Flags().StringVar(&initialGoal, "goal", "", "initial natural language query goal")
 	agentCmd.Flags().StringVar(&initialResourceType, "resource-type", "MEASURE", "initial resource type: MEASURE, STREAM, TRACE, PROPERTY, or TOPN")
 	agentCmd.Flags().StringVar(&initialResourceName, "name", "", "initial resource name")
 	agentCmd.Flags().StringVar(&initialGroups, "groups", "", "initial group list")
 	agentCmd.Flags().StringVar(&initialStart, "start", "-30m", "initial BYDBQL time start")
 	agentCmd.Flags().StringVar(&initialEnd, "end", "", "initial BYDBQL time end")
-	agentCmd.Flags().IntVar(&maxRetries, "agent-retries", 2, "maximum agent repair retries after validation errors")
+	agentCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 3*time.Second, "timeout for one approved BYDBQL query")
+	agentCmd.Flags().IntVar(&previewRows, "preview-rows", 50, "maximum rows kept in the local result preview")
 	agentCmd.Flags().StringVar(&logDir, "log-dir", "", "directory for agent session logs; default is $HOME/.bydbctl/logs")
+	bindTLSRelatedFlag(agentCmd)
 	return agentCmd
 }
 
-func newAgentGateway(provider, codexBin, acpCommand string, acpArgs []string, mcpConfig string, workingDirectory string) (agent.Gateway, error) {
+func newAgentGateway(provider, acpCommand string, acpArgs []string, workingDirectory string, mcpServers any) (agent.Gateway, error) {
 	switch provider {
-	case agentProviderFake:
-		return fake.NewGateway(), nil
-	case agentProviderCodexExec:
-		return codex.NewExecGateway(
-			codex.WithBinPath(codexBin),
-			codex.WithWorkingDirectory(workingDirectory),
-		), nil
 	case agentProviderACP:
-		mcpServers, mcpErr := loadMCPServers(mcpConfig, workingDirectory)
-		if mcpErr != nil {
-			return nil, mcpErr
-		}
 		return acp.NewGateway(acpCommand, acpArgs...).WithWorkingDirectory(workingDirectory).WithMCPServers(mcpServers), nil
 	case agentProviderCodexACP:
-		mcpServers, mcpErr := loadMCPServers(mcpConfig, workingDirectory)
-		if mcpErr != nil {
-			return nil, mcpErr
-		}
 		return acp.NewGateway("npx", "-y", "@agentclientprotocol/codex-acp").WithWorkingDirectory(workingDirectory).WithMCPServers(mcpServers), nil
 	default:
-		return nil, fmt.Errorf("unsupported agent provider %q", provider)
+		return nil, fmt.Errorf("unsupported agent provider %q; use codex-acp or acp", provider)
 	}
 }
 
-func loadMCPServers(configPath, workingDirectory string) (any, error) {
-	if configPath == "" {
-		return nil, nil
-	}
-	resolvedPath := configPath
-	if !filepath.IsAbs(resolvedPath) {
-		resolvedPath = filepath.Join(workingDirectory, resolvedPath)
-	}
-	configBytes, readErr := os.ReadFile(resolvedPath)
-	if readErr != nil {
-		if os.IsNotExist(readErr) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to read MCP config %s: %w", resolvedPath, readErr)
-	}
-	var rawConfig map[string]any
-	if unmarshalErr := json.Unmarshal(configBytes, &rawConfig); unmarshalErr != nil {
-		return nil, fmt.Errorf("failed to parse MCP config %s: %w", resolvedPath, unmarshalErr)
-	}
-	mcpServers, ok := rawConfig["mcpServers"]
-	if !ok {
-		return nil, nil
-	}
-	return normalizeMCPServers(mcpServers), nil
-}
-
-func normalizeMCPServers(value any) any {
-	switch typedValue := value.(type) {
-	case []any:
-		return typedValue
-	case map[string]any:
-		servers := make([]any, 0, len(typedValue))
-		for name, serverValue := range typedValue {
-			server, serverOK := serverValue.(map[string]any)
-			if !serverOK {
-				continue
+func newAgentToolBridgeCmd() *cobra.Command {
+	var socketPath string
+	toolBridgeCmd := &cobra.Command{
+		Use:    "agent-tool-bridge",
+		Hidden: true,
+		Short:  "Run the internal bydbctl agent tool bridge",
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if serveErr := bridge.ServeMCP(socketPath, cmd.InOrStdin(), cmd.OutOrStdout()); serveErr != nil {
+				return fmt.Errorf("failed to serve controlled MCP tools: %w", serveErr)
 			}
-			serverCopy := make(map[string]any, len(server)+1)
-			for serverKey, configValue := range server {
-				serverCopy[serverKey] = configValue
-			}
-			if _, hasName := serverCopy["name"]; !hasName {
-				serverCopy["name"] = name
-			}
-			servers = append(servers, serverCopy)
-		}
-		return servers
-	default:
-		return []any{}
+			return nil
+		},
 	}
+	toolBridgeCmd.Flags().StringVar(&socketPath, "socket", "", "private bydbctl tool bridge socket")
+	return toolBridgeCmd
 }

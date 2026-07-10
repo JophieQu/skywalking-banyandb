@@ -3,7 +3,7 @@
 `bydbctl` is the command line tool for interacting with BanyanDB. It is a powerful tool that can be used to create, update, read, and delete
 schemas. It can also be used to query data stored in streams, measures, traces, and properties.
 
-`bydbctl agent` opens an interactive BYDBQL agent TUI. It helps users generate, edit, validate, execute, and accept BYDBQL queries. See
+`bydbctl agent` opens an interactive BYDBQL agent TUI. It helps users generate, edit, validate, approve, and execute BYDBQL queries. See
 [BYDBQL Agent TUI](agent.md) for details.
 
 These are several ways to install:

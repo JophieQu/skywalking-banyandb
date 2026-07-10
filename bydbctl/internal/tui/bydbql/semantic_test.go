@@ -40,6 +40,21 @@ func TestSemanticValidatorRequiresTimeClause(t *testing.T) {
 	}
 }
 
+func TestSemanticValidatorRequiresLimitClause(t *testing.T) {
+	validator := NewSemanticValidator()
+	schema := &session.SchemaSnapshot{Type: session.ResourceTypeMeasure}
+	report, validateErr := validator.Validate(context.Background(), "SELECT * FROM MEASURE service_latency IN production TIME > '-30m'", schema)
+	if validateErr != nil {
+		t.Fatalf("Validate returned error: %v", validateErr)
+	}
+	if report.Valid {
+		t.Fatal("expected missing LIMIT clause to be invalid")
+	}
+	if !strings.Contains(report.Message, "LIMIT clause") {
+		t.Fatalf("unexpected message: %s", report.Message)
+	}
+}
+
 func TestSemanticValidatorRejectsNonIndexedOrderBy(t *testing.T) {
 	validator := NewSemanticValidator()
 	schema := &session.SchemaSnapshot{

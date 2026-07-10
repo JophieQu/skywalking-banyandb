@@ -56,8 +56,16 @@ func (m *Model) recordAgentActivities(events []agent.Event) {
 
 func activityCategory(event agent.Event) string {
 	switch event.Kind {
-	case agent.EventKindToolCall:
+	case agent.EventKindToolCall, agent.EventKindToolResult:
 		return "tool"
+	case agent.EventKindCandidate:
+		return "candidate"
+	case agent.EventKindClarification:
+		return "clarification"
+	case agent.EventKindApproval:
+		return "approval"
+	case agent.EventKindCancelled:
+		return "cancelled"
 	case agent.EventKindPlanUpdate:
 		return "plan"
 	case agent.EventKindFinalResponse:
@@ -73,11 +81,17 @@ func activityCategory(event agent.Event) string {
 
 func activityTitle(event agent.Event) string {
 	switch event.Kind {
-	case agent.EventKindToolCall:
-		if strings.TrimSpace(event.Message) != "" {
-			return "tool: " + singleLine(event.Message)
-		}
-		return "tool call"
+	case agent.EventKindToolCall, agent.EventKindToolResult:
+		toolName := fallback(event.ToolName, "tool")
+		return fmt.Sprintf("tool %s: %s", toolName, fallback(string(event.Status), "updated"))
+	case agent.EventKindCandidate:
+		return "candidate: validated"
+	case agent.EventKindClarification:
+		return "agent question: " + fallback(singleLine(event.Message), "clarification needed")
+	case agent.EventKindApproval:
+		return "approval: waiting for user"
+	case agent.EventKindCancelled:
+		return "cancelled: " + fallback(singleLine(event.Message), "agent action")
 	case agent.EventKindPlanUpdate:
 		if strings.TrimSpace(event.Message) != "" {
 			return "plan: " + singleLine(event.Message)
@@ -94,7 +108,7 @@ func activityTitle(event agent.Event) string {
 		}
 		return "error"
 	case agent.EventKindPermissionRequest:
-		return "permission: denied by workflow"
+		return "permission: " + fallback(singleLine(event.Message), "denied by workflow")
 	default:
 		if strings.TrimSpace(event.Message) != "" {
 			return string(event.Kind) + ": " + singleLine(event.Message)
@@ -107,6 +121,12 @@ func activityDetail(event agent.Event) string {
 	var parts []string
 	if strings.TrimSpace(event.Candidate) != "" {
 		parts = append(parts, "candidate="+event.Candidate)
+	}
+	if strings.TrimSpace(event.InputSummary) != "" {
+		parts = append(parts, "input="+event.InputSummary)
+	}
+	if strings.TrimSpace(event.OutputSummary) != "" {
+		parts = append(parts, "output="+event.OutputSummary)
 	}
 	if strings.TrimSpace(event.Message) != "" {
 		parts = append(parts, event.Message)
@@ -140,12 +160,8 @@ func (m *Model) recordExecutionActivity(querySession *session.QuerySession) {
 	if executionResult.Hint != "" {
 		detailParts = append(detailParts, "hint="+executionResult.Hint)
 	}
-	if executionResult.Response != "" {
-		detailParts = append(detailParts, executionResult.Response)
-	}
 	m.recordActivity("execution", title, strings.Join(detailParts, "\n"))
 }
-
 
 func (m *Model) scrollSchemaDetail(delta int, viewportHeight int) {
 	if viewportHeight <= 0 {

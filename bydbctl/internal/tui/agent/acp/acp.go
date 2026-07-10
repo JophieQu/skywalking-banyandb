@@ -553,9 +553,15 @@ func NormalizeEvent(line []byte) agent.Event {
 	candidate := stringValue(params, "candidate", "bydbql", "query", "final")
 	switch {
 	case strings.Contains(method, "permission"):
+		permissionMessage := fallbackMessage(message, "ACP permission request")
+		if isControlledToolPermission(params) {
+			permissionMessage = "controlled bydbctl tool permission granted"
+		} else {
+			permissionMessage = "ACP permission request denied by bydbctl workflow"
+		}
 		return agent.Event{
 			Kind:       agent.EventKindPermissionRequest,
-			Message:    fallbackMessage(message, "ACP permission request denied by bydbctl workflow"),
+			Message:    permissionMessage,
 			Permission: message,
 		}
 	case strings.Contains(method, "plan"):
@@ -591,6 +597,11 @@ func normalizeSessionUpdate(params map[string]any) agent.Event {
 			Kind:    agent.EventKindPlanUpdate,
 			Message: planMessage(update),
 		}
+	case "clarification", "question":
+		return agent.Event{
+			Kind:    agent.EventKindClarification,
+			Message: fallbackMessage(contentText(mapValue(update, "content")), stringValue(update, "message", "text")),
+		}
 	case "tool_call", "tool_call_update":
 		return agent.Event{
 			Kind:    agent.EventKindToolCall,
@@ -616,6 +627,24 @@ func buildPrompt(req agent.TurnRequest) (string, error) {
 
 func permissionDecision(params map[string]any) map[string]any {
 	options, _ := params["options"].([]any)
+	if isControlledToolPermission(params) {
+		for _, optionValue := range options {
+			option, optionOK := optionValue.(map[string]any)
+			if !optionOK {
+				continue
+			}
+			optionID := stringValue(option, "optionId", "option_id", "id")
+			optionKind := strings.ToLower(stringValue(option, "kind", "type", "name"))
+			if optionID != "" && (strings.Contains(optionKind, "allow") || strings.Contains(optionKind, "approve")) {
+				return map[string]any{
+					"outcome": map[string]any{
+						"outcome":  "selected",
+						"optionId": optionID,
+					},
+				}
+			}
+		}
+	}
 	for _, optionValue := range options {
 		option, optionOK := optionValue.(map[string]any)
 		if !optionOK {
@@ -636,6 +665,20 @@ func permissionDecision(params map[string]any) map[string]any {
 		"outcome": map[string]any{
 			"outcome": "cancelled",
 		},
+	}
+}
+
+func isControlledToolPermission(params map[string]any) bool {
+	toolCall := mapValue(params, "toolCall", "tool_call")
+	toolName := stringValue(toolCall, "name")
+	if toolName == "" {
+		toolName = stringValue(toolCall, "title")
+	}
+	switch toolName {
+	case "list_groups_schemas", "describe_schema", "validate_bydbql", "execute_bydbql":
+		return true
+	default:
+		return false
 	}
 }
 

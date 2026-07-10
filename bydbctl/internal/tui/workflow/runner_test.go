@@ -88,7 +88,7 @@ func TestStartSessionDiscoversSchemaWithoutCandidate(t *testing.T) {
 	}
 }
 
-func TestReviseWithFakeAgentAndAccept(t *testing.T) {
+func TestReviseWithFakeAgentAndExecuteAfterApproval(t *testing.T) {
 	runner := NewRunner(Config{AgentGateway: fake.NewGateway()})
 	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
 		ResourceType: session.ResourceTypeMeasure,
@@ -109,18 +109,15 @@ func TestReviseWithFakeAgentAndAccept(t *testing.T) {
 	if querySession.Phase != session.PhaseReady {
 		t.Fatalf("unexpected phase: %s", querySession.Phase)
 	}
-	if executeErr := runner.ExecuteCurrent(context.Background(), querySession); executeErr != nil {
+	if executeErr := executeAfterApproval(t, runner, querySession); executeErr != nil {
 		t.Fatalf("ExecuteCurrent returned error: %v", executeErr)
 	}
-	if acceptErr := runner.AcceptCurrent(querySession); acceptErr != nil {
-		t.Fatalf("AcceptCurrent returned error: %v", acceptErr)
-	}
-	if querySession.AcceptedQuery == "" {
-		t.Fatal("expected accepted query")
+	if querySession.Phase != session.PhaseExecuted {
+		t.Fatalf("expected executed phase, got %s", querySession.Phase)
 	}
 }
 
-func TestAcceptCurrentRejectsInvalidCandidate(t *testing.T) {
+func TestExecuteCurrentRejectsInvalidCandidateBeforeApproval(t *testing.T) {
 	runner := NewRunner(Config{AgentGateway: fake.NewGateway()})
 	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
 		ResourceType: session.ResourceTypeStream,
@@ -134,12 +131,40 @@ func TestAcceptCurrentRejectsInvalidCandidate(t *testing.T) {
 	if validateErr := runner.ValidateManualQuery(context.Background(), querySession, "SELECT FROM"); validateErr != nil {
 		t.Fatalf("ValidateManualQuery returned error: %v", validateErr)
 	}
-	if acceptErr := runner.AcceptCurrent(querySession); acceptErr == nil {
+	if executeErr := runner.ExecuteCurrent(context.Background(), querySession); executeErr == nil {
 		t.Fatal("expected invalid candidate to be rejected")
 	}
 }
 
-func TestReviseWithAgentExtractsCandidateFromMessage(t *testing.T) {
+func TestExecuteCurrentRevalidatesAfterApproval(t *testing.T) {
+	validator := &sequenceValidator{reports: []session.ValidationReport{
+		{Valid: true, Message: "initial validation", QueryType: "MEASURE"},
+		{Valid: false, Message: "schema changed", QueryType: "MEASURE"},
+	}}
+	runner := NewRunner(Config{AgentGateway: fake.NewGateway(), Validator: validator})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"production"},
+		Goal:         "average latency",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	query := "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10"
+	if validateErr := runner.ValidateManualQuery(context.Background(), querySession, query); validateErr != nil {
+		t.Fatalf("ValidateManualQuery returned error: %v", validateErr)
+	}
+	executeErr := executeAfterApproval(t, runner, querySession)
+	if executeErr == nil || !strings.Contains(executeErr.Error(), "failed revalidation") {
+		t.Fatalf("expected immediate revalidation failure, got %v", executeErr)
+	}
+	if querySession.ExecutionResult.Query != "" {
+		t.Fatalf("query must not execute after failed revalidation: %+v", querySession.ExecutionResult)
+	}
+}
+
+func TestReviseWithAgentRejectsCandidateEmbeddedInMessage(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
@@ -158,16 +183,12 @@ func TestReviseWithAgentExtractsCandidateFromMessage(t *testing.T) {
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
-		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
-	}
-	currentCandidate := querySession.CurrentCandidate()
-	if currentCandidate == nil || !strings.Contains(currentCandidate.Query, "SELECT * FROM STREAM sw") {
-		t.Fatalf("unexpected candidate: %+v", currentCandidate)
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr == nil {
+		t.Fatal("expected unstructured response to be rejected")
 	}
 }
 
-func TestReviseWithAgentExtractsCandidateFromChunkedMessages(t *testing.T) {
+func TestReviseWithAgentRejectsCandidateEmbeddedInChunkedMessages(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
@@ -194,16 +215,12 @@ func TestReviseWithAgentExtractsCandidateFromChunkedMessages(t *testing.T) {
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
-		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
-	}
-	currentCandidate := querySession.CurrentCandidate()
-	if currentCandidate == nil || !strings.Contains(currentCandidate.Query, "TIME > '-30m' LIMIT 10") {
-		t.Fatalf("unexpected candidate: %+v", currentCandidate)
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr == nil {
+		t.Fatal("expected unstructured chunks to be rejected")
 	}
 }
 
-func TestReviseWithAgentExtractsCandidateFromFragmentedCodexACPOutput(t *testing.T) {
+func TestReviseWithAgentRejectsCandidateEmbeddedInFragmentedACPOutput(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{Kind: agent.EventKindMessageDelta, Message: "```"},
@@ -244,16 +261,8 @@ func TestReviseWithAgentExtractsCandidateFromFragmentedCodexACPOutput(t *testing
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
-		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
-	}
-	currentCandidate := querySession.CurrentCandidate()
-	if currentCandidate == nil {
-		t.Fatal("expected candidate")
-	}
-	expected := "SELECT * FROM MEASURE service_endpoint_latency IN default TIME > '-30m' LIMIT 100"
-	if currentCandidate.Query != expected {
-		t.Fatalf("unexpected candidate:\nwant: %s\n got: %s", expected, currentCandidate.Query)
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr == nil {
+		t.Fatal("expected fragmented unstructured output to be rejected")
 	}
 }
 
@@ -284,7 +293,7 @@ func TestRepairFragmentedQueryAggregateAVG(t *testing.T) {
 	}
 }
 
-func TestFinalCandidateClaudeACPFragmentedShowTop(t *testing.T) {
+func TestFinalCandidateDoesNotInferFromClaudeACPMessageFragments(t *testing.T) {
 	fragments := []string{
 		"```", "b", "yd", "b", "ql", "text", "SH", "OW", "TOP", "text", "10", "FROM", "ME", "AS", "URE",
 		"service", "_end", "point", "_l", "at", "ency", "IN", "sw", "_", "metrics", "TIME", ">", "'-", "30", "m", "'",
@@ -302,16 +311,12 @@ func TestFinalCandidateClaudeACPFragmentedShowTop(t *testing.T) {
 		Message: strings.Join(buffered, "\n"),
 	})
 	candidate := finalCandidate(events)
-	if candidate == "" {
-		t.Fatal("expected candidate from claude-acp fragmented SHOW TOP output")
-	}
-	expected := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN sw_metrics TIME > '-30m' AGGREGATE BY SUM ORDER BY DESC"
-	if candidate != expected {
-		t.Fatalf("unexpected candidate:\nwant: %s\n got: %s", expected, candidate)
+	if candidate != "" {
+		t.Fatalf("unexpected inferred candidate: %s", candidate)
 	}
 }
 
-func TestReviseWithAgentExtractsCandidateFromJSONMessage(t *testing.T) {
+func TestReviseWithAgentRejectsCandidateEmbeddedInJSONMessage(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
@@ -332,12 +337,8 @@ func TestReviseWithAgentExtractsCandidateFromJSONMessage(t *testing.T) {
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
-		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
-	}
-	currentCandidate := querySession.CurrentCandidate()
-	if currentCandidate == nil || !strings.Contains(currentCandidate.Query, "SELECT * FROM MEASURE service_latency") {
-		t.Fatalf("unexpected candidate: %+v", currentCandidate)
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr == nil {
+		t.Fatal("expected JSON text without a structured event to be rejected")
 	}
 }
 
@@ -410,6 +411,41 @@ func TestReviseWithAgentKeepsInvalidCandidateForNextTurn(t *testing.T) {
 	}
 }
 
+func TestStartAgentTurnStreamsEventsBeforeCompletion(t *testing.T) {
+	gateway := scriptedGateway{events: []agent.Event{
+		{Kind: agent.EventKindPlanUpdate, Message: "inspect schema"},
+		{Kind: agent.EventKindCandidate, Candidate: "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10"},
+		{Kind: agent.EventKindFinalResponse, Message: "candidate ready"},
+	}}
+	runner := NewRunner(Config{AgentGateway: gateway})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"production"},
+		Goal:         "average latency",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	updates, turnErr := runner.StartAgentTurn(context.Background(), querySession, "")
+	if turnErr != nil {
+		t.Fatalf("StartAgentTurn returned error: %v", turnErr)
+	}
+	firstUpdate := <-updates
+	if firstUpdate.Event == nil || firstUpdate.Event.Kind != agent.EventKindPlanUpdate || firstUpdate.Done {
+		t.Fatalf("expected first plan update before completion, got %+v", firstUpdate)
+	}
+	for update := range updates {
+		if update.Done && update.Err != nil {
+			t.Fatalf("unexpected streamed turn error: %v", update.Err)
+		}
+	}
+	currentCandidate := querySession.CurrentCandidate()
+	if currentCandidate == nil || currentCandidate.Query == "" {
+		t.Fatal("expected stream completion to retain the structured candidate")
+	}
+}
+
 func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	var requests []agent.TurnRequest
 	gateway := scriptedGateway{
@@ -435,7 +471,7 @@ func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	if validateErr := runner.ValidateManualQuery(context.Background(), querySession, query); validateErr != nil {
 		t.Fatalf("ValidateManualQuery returned error: %v", validateErr)
 	}
-	if executeErr := runner.ExecuteCurrent(context.Background(), querySession); executeErr != nil {
+	if executeErr := executeAfterApproval(t, runner, querySession); executeErr != nil {
 		t.Fatalf("ExecuteCurrent returned error: %v", executeErr)
 	}
 	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
@@ -448,8 +484,11 @@ func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	if payload.ExecutionSummary == nil {
 		t.Fatal("expected execution summary in agent payload")
 	}
-	if payload.ExecutionSummary.Command != "POST /api/v1/bydbql/query" {
-		t.Fatalf("unexpected command: %s", payload.ExecutionSummary.Command)
+	if payload.ExecutionSummary.Query != query {
+		t.Fatalf("unexpected query: %s", payload.ExecutionSummary.Query)
+	}
+	if payload.ExecutionSummary.ResourceType != "" || len(payload.ExecutionSummary.Columns) != 0 {
+		t.Fatalf("unexpected data-bearing execution summary: %+v", payload.ExecutionSummary)
 	}
 	if !payload.Constraints.UserMustEditOrConfirmBeforeExecute {
 		t.Fatal("expected execution confirmation constraint")
@@ -485,4 +524,31 @@ func (gateway scriptedGateway) Send(ctx context.Context, _ string, req agent.Tur
 
 func (gateway scriptedGateway) Stop(_ context.Context, _ string) error {
 	return nil
+}
+
+func executeAfterApproval(t *testing.T, runner *Runner, querySession *session.QuerySession) error {
+	t.Helper()
+	executeErrCh := make(chan error, 1)
+	go func() {
+		executeErrCh <- runner.ExecuteCurrent(context.Background(), querySession)
+	}()
+	request := <-runner.ApprovalRequests()
+	if resolveErr := runner.ResolveApproval(request.ID, true); resolveErr != nil {
+		t.Fatalf("failed to approve execution: %v", resolveErr)
+	}
+	return <-executeErrCh
+}
+
+type sequenceValidator struct {
+	reports []session.ValidationReport
+	calls   int
+}
+
+func (validator *sequenceValidator) Validate(_ context.Context, _ string, _ *session.SchemaSnapshot) (session.ValidationReport, error) {
+	reportIndex := validator.calls
+	validator.calls++
+	if reportIndex >= len(validator.reports) {
+		reportIndex = len(validator.reports) - 1
+	}
+	return validator.reports[reportIndex], nil
 }

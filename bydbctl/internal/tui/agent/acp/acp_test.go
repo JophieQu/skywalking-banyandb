@@ -68,6 +68,15 @@ func TestNormalizeEventMapsAgentMessageChunk(t *testing.T) {
 	}
 }
 
+func TestNormalizeEventMapsClarification(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","method":"session/update",` +
+		`"params":{"update":{"sessionUpdate":"clarification","content":{"text":"Which group should I use?"}}}}`)
+	event := NormalizeEvent(line)
+	if event.Kind != agent.EventKindClarification || event.Message != "Which group should I use?" {
+		t.Fatalf("unexpected clarification event: %+v", event)
+	}
+}
+
 func TestNormalizeEventMapsPermissionRequest(t *testing.T) {
 	line := []byte(`{
 		"jsonrpc": "2.0",
@@ -85,6 +94,42 @@ func TestNormalizeEventMapsPermissionRequest(t *testing.T) {
 	}
 	if event.Message == "" {
 		t.Fatal("expected permission message")
+	}
+}
+
+func TestPermissionDecisionAllowsOnlyControlledTools(t *testing.T) {
+	decision := permissionDecision(map[string]any{
+		"toolCall": map[string]any{"name": "validate_bydbql"},
+		"options": []any{
+			map[string]any{"optionId": "allow", "kind": "allow_once"},
+			map[string]any{"optionId": "reject", "kind": "reject_once"},
+		},
+	})
+	outcome := mapValue(decision, "outcome")
+	if stringValue(outcome, "optionId") != "allow" {
+		t.Fatalf("expected controlled tool permission to be approved: %+v", decision)
+	}
+	decision = permissionDecision(map[string]any{
+		"toolCall": map[string]any{"name": "shell"},
+		"options": []any{
+			map[string]any{"optionId": "allow", "kind": "allow_once"},
+			map[string]any{"optionId": "reject", "kind": "reject_once"},
+		},
+	})
+	outcome = mapValue(decision, "outcome")
+	if stringValue(outcome, "optionId") != "reject" {
+		t.Fatalf("expected external tool permission to be rejected: %+v", decision)
+	}
+	decision = permissionDecision(map[string]any{
+		"toolCall": map[string]any{"name": "evil_validate_bydbql"},
+		"options": []any{
+			map[string]any{"optionId": "allow", "kind": "allow_once"},
+			map[string]any{"optionId": "reject", "kind": "reject_once"},
+		},
+	})
+	outcome = mapValue(decision, "outcome")
+	if stringValue(outcome, "optionId") != "reject" {
+		t.Fatalf("expected lookalike tool permission to be rejected: %+v", decision)
 	}
 }
 

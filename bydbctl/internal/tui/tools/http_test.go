@@ -282,6 +282,12 @@ func TestHTTPExecutorExecuteBydbQL(t *testing.T) {
 	if executionResult.Response == "" {
 		t.Fatal("expected raw response preview")
 	}
+	if executionResult.ResourceType != "measure" {
+		t.Fatalf("unexpected resource type: %s", executionResult.ResourceType)
+	}
+	if len(executionResult.Columns) == 0 || len(executionResult.Preview) != 2 {
+		t.Fatalf("expected a structured table preview, got columns=%v preview=%v", executionResult.Columns, executionResult.Preview)
+	}
 }
 
 func TestHTTPExecutorDiscoverCatalog(t *testing.T) {
@@ -330,6 +336,31 @@ func TestHTTPExecutorDiscoverCatalog(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected measure catalog entry, got %+v", catalog.Entries)
+	}
+}
+
+func TestHTTPExecutorUsesBydbctlTLSSettings(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/group/schema/lists" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body, marshalErr := protojson.Marshal(&databasev1.GroupRegistryServiceListResponse{
+			Group: []*commonv1.Group{{Metadata: &commonv1.Metadata{Name: "production"}}},
+		})
+		if marshalErr != nil {
+			t.Fatalf("failed to marshal groups: %v", marshalErr)
+		}
+		_, _ = writer.Write(body)
+	}))
+	defer server.Close()
+	executor := NewHTTPExecutor(HTTPConfig{Addr: server.URL, EnableTLS: true, Insecure: true})
+	catalog, catalogErr := executor.DiscoverCatalog(context.Background())
+	if catalogErr != nil {
+		t.Fatalf("DiscoverCatalog returned error: %v", catalogErr)
+	}
+	if !reflect.DeepEqual(catalog.Groups, []string{"production"}) {
+		t.Fatalf("unexpected TLS catalog groups: %v", catalog.Groups)
 	}
 }
 

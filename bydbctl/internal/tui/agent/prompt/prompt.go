@@ -95,12 +95,14 @@ func writeRole(prompt *bytes.Buffer) {
 
 func writeHardRules(prompt *bytes.Buffer, initial bool) {
 	prompt.WriteString("Hard rules:\n")
-	prompt.WriteString("- Return exactly one BYDBQL statement in one fenced code block marked bydbql.\n")
-	prompt.WriteString("- The final answer must end with the fenced code block and must not include prose after it.\n")
+	prompt.WriteString("- Use validate_bydbql with the complete candidate before presenting it to the user. This is the only way to publish a candidate.\n")
+	prompt.WriteString("- Do not rely on Markdown, JSON, or prose to communicate a candidate; bydbctl ignores candidates embedded in text.\n")
 	prompt.WriteString("- The statement must start with SELECT or SHOW TOP.\n")
 	prompt.WriteString("- Do not include a trailing semicolon.\n")
 	prompt.WriteString("- Use only the schema summary, slots, query_hints, and template_hint from the context JSON.\n")
-	prompt.WriteString("- Do not call external tools, shell commands, or MCP servers.\n")
+	prompt.WriteString("- Use only the four provided bydbctl tools. Do not use shell commands, external MCP servers, downloads, or runtime tool registration.\n")
+	prompt.WriteString("- You may use schema and validation tools without asking. Call execute_bydbql only after the user explicitly asks to run the exact statement; ")
+	prompt.WriteString("it always requires a fresh TUI approval.\n")
 	prompt.WriteString("- Keep the query read-only. Never generate create, update, delete, drop, or apply operations.\n")
 	prompt.WriteString("- When query_hints.slots_pinned=true, use schema.type, schema.name, and schema.groups exactly.\n")
 	prompt.WriteString("- When query_hints.slots_pinned=false and schema.catalog is present, choose the best matching catalog entry for the goal.\n")
@@ -110,7 +112,7 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 		prompt.WriteString("- For exploratory SELECT queries, include LIMIT 10 unless query_hints specify otherwise.\n")
 	} else {
 		prompt.WriteString("- Fix validation_error or execution_summary.error when present; preserve correct parts of the candidate.\n")
-		prompt.WriteString("- Return only the fenced bydbql block; do not echo validation metadata, JSON fields, or explanatory prose.\n")
+		prompt.WriteString("- After validate_bydbql succeeds, give a short user-facing summary. Do not repeat the query in Markdown or JSON.\n")
 	}
 	prompt.WriteString("- ORDER BY may only use fields listed in schema.indexed_fields; omit ORDER BY when no indexed field matches.\n\n")
 }
@@ -139,8 +141,6 @@ func writeReferences(prompt *bytes.Buffer) {
 
 func writeOutputContract(prompt *bytes.Buffer) {
 	prompt.WriteString("Output contract:\n")
-	prompt.WriteString("```bydbql\n")
-	prompt.WriteString("<one BYDBQL statement only>\n")
-	prompt.WriteString("```\n")
-	prompt.WriteString(fmt.Sprintf("Alternative accepted format: {\"bydbql\":\"<statement>\"} or {\"BydbQL\":\"<statement>\"}\n\n"))
+	prompt.WriteString("- Explain your plan and result briefly in user-facing language.\n")
+	prompt.WriteString(fmt.Sprintf("- Publish the complete candidate through %s; do not embed it in free text.\n\n", "validate_bydbql"))
 }

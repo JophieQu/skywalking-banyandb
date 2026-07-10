@@ -19,8 +19,13 @@ package tools
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,37 +40,45 @@ import (
 )
 
 const (
-	defaultHTTPTimeout = 3 * time.Second
-	groupListPath      = "/api/v1/group/schema/lists"
-	measureSchemaPath  = "/api/v1/measure/schema/{group}/{name}"
-	streamSchemaPath   = "/api/v1/stream/schema/{group}/{name}"
-	traceSchemaPath    = "/api/v1/trace/schema/{group}/{name}"
-	propertySchemaPath = "/api/v1/property/schema/{group}/{name}"
-	topnSchemaPath     = "/api/v1/topn-agg/schema/{group}/{name}"
-	measureListPath    = "/api/v1/measure/schema/lists/{group}"
-	streamListPath     = "/api/v1/stream/schema/lists/{group}"
-	traceListPath      = "/api/v1/trace/schema/lists/{group}"
-	propertyListPath   = "/api/v1/property/schema/lists/{group}"
-	topnListPath       = "/api/v1/topn-agg/schema/lists/{group}"
-	indexRuleListPath         = "/api/v1/index-rule/schema/lists/{group}"
-	indexRuleBindingListPath  = "/api/v1/index-rule-binding/schema/lists/{group}"
-	bydbqlQueryPath           = "/api/v1/bydbql/query"
+	defaultHTTPTimeout       = 3 * time.Second
+	maxPreviewCellRunes      = 120
+	defaultPreviewRows       = 50
+	groupListPath            = "/api/v1/group/schema/lists"
+	measureSchemaPath        = "/api/v1/measure/schema/{group}/{name}"
+	streamSchemaPath         = "/api/v1/stream/schema/{group}/{name}"
+	traceSchemaPath          = "/api/v1/trace/schema/{group}/{name}"
+	propertySchemaPath       = "/api/v1/property/schema/{group}/{name}"
+	topnSchemaPath           = "/api/v1/topn-agg/schema/{group}/{name}"
+	measureListPath          = "/api/v1/measure/schema/lists/{group}"
+	streamListPath           = "/api/v1/stream/schema/lists/{group}"
+	traceListPath            = "/api/v1/trace/schema/lists/{group}"
+	propertyListPath         = "/api/v1/property/schema/lists/{group}"
+	topnListPath             = "/api/v1/topn-agg/schema/lists/{group}"
+	indexRuleListPath        = "/api/v1/index-rule/schema/lists/{group}"
+	indexRuleBindingListPath = "/api/v1/index-rule-binding/schema/lists/{group}"
+	bydbqlQueryPath          = "/api/v1/bydbql/query"
 )
 
 // HTTPConfig configures schema discovery through BanyanDB's HTTP API.
 type HTTPConfig struct {
-	Timeout  time.Duration
-	Addr     string
-	Username string
-	Password string
+	Timeout        time.Duration
+	Addr           string
+	Username       string
+	Password       string
+	Cert           string
+	EnableTLS      bool
+	Insecure       bool
+	MaxPreviewRows int
 }
 
 // HTTPExecutor discovers schema through BanyanDB's read-only HTTP endpoints.
 type HTTPExecutor struct {
-	client   *resty.Client
-	fallback *ReadOnlyExecutor
-	config   HTTPConfig
-	now      func() time.Time
+	client    *resty.Client
+	fallback  *ReadOnlyExecutor
+	config    HTTPConfig
+	now       func() time.Time
+	configErr error
+	limits    ExecutionLimits
 }
 
 // NewHTTPExecutor creates a read-only HTTP executor.
@@ -74,18 +87,54 @@ func NewHTTPExecutor(config HTTPConfig) *HTTPExecutor {
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeout
 	}
+	previewRows := config.MaxPreviewRows
+	if previewRows <= 0 {
+		previewRows = defaultPreviewRows
+	}
 	client := resty.New().SetTimeout(timeout)
-	return &HTTPExecutor{
+	executor := &HTTPExecutor{
 		client:   client,
 		fallback: NewReadOnlyExecutor(),
 		config: HTTPConfig{
-			Timeout:  timeout,
-			Addr:     strings.TrimRight(config.Addr, "/"),
-			Username: config.Username,
-			Password: config.Password,
+			Timeout:        timeout,
+			Addr:           strings.TrimRight(config.Addr, "/"),
+			Username:       config.Username,
+			Password:       config.Password,
+			Cert:           config.Cert,
+			EnableTLS:      config.EnableTLS,
+			Insecure:       config.Insecure,
+			MaxPreviewRows: previewRows,
 		},
-		now: time.Now,
+		now:    time.Now,
+		limits: ExecutionLimits{Timeout: timeout, PreviewRows: previewRows},
 	}
+	if config.EnableTLS {
+		tlsConfig := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			// #nosec G402 -- this directly preserves bydbctl's --insecure flag semantics.
+			InsecureSkipVerify: config.Insecure,
+		}
+		if strings.TrimSpace(config.Cert) != "" {
+			certificate, readErr := os.ReadFile(config.Cert)
+			if readErr != nil {
+				executor.configErr = fmt.Errorf("failed to read TLS certificate: %w", readErr)
+				return executor
+			}
+			certificatePool := x509.NewCertPool()
+			if !certificatePool.AppendCertsFromPEM(certificate) {
+				executor.configErr = fmt.Errorf("failed to add server TLS certificate")
+				return executor
+			}
+			tlsConfig.RootCAs = certificatePool
+		}
+		client.SetTLSClientConfig(tlsConfig)
+	}
+	return executor
+}
+
+// ExecutionLimits returns the executor's effective timeout and preview bound.
+func (executor *HTTPExecutor) ExecutionLimits() ExecutionLimits {
+	return executor.limits
 }
 
 const maxCatalogEntries = 400
@@ -93,6 +142,9 @@ const maxCatalogEntries = 400
 // DiscoverCatalog lists groups and resource names across supported resource types.
 func (executor *HTTPExecutor) DiscoverCatalog(ctx context.Context) (session.SchemaCatalog, error) {
 	catalog := session.SchemaCatalog{UpdatedAt: executor.now()}
+	if executor.configErr != nil {
+		return catalog, executor.configErr
+	}
 	if executor.config.Addr == "" {
 		return catalog, nil
 	}
@@ -163,6 +215,9 @@ func extractGroupMetadata(groups []*commonv1.Group) []*commonv1.Metadata {
 
 // DiscoverSchema fetches and summarizes a resource schema, falling back to a local snapshot when unavailable.
 func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequest) (session.SchemaSnapshot, error) {
+	if executor.configErr != nil {
+		return session.SchemaSnapshot{}, executor.configErr
+	}
 	fallbackSnapshot, fallbackErr := executor.fallback.DiscoverSchema(ctx, req)
 	if fallbackErr != nil {
 		return session.SchemaSnapshot{}, fallbackErr
@@ -339,6 +394,9 @@ func (executor *HTTPExecutor) listIndexRuleBindings(ctx context.Context, group s
 
 // Execute runs a read-only BYDBQL query through the BanyanDB HTTP gateway.
 func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session.QuerySession, query string) (session.ExecutionResult, error) {
+	if executor.configErr != nil {
+		return session.ExecutionResult{}, executor.configErr
+	}
 	if executor.config.Addr == "" {
 		return executor.fallback.Execute(ctx, querySession, query)
 	}
@@ -346,6 +404,7 @@ func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session
 	if trimmedQuery == "" {
 		return session.ExecutionResult{}, fmt.Errorf("BYDBQL query is required")
 	}
+	requestStartedAt := time.Now()
 	requestBody, marshalErr := protojson.Marshal(&bydbqlv1.QueryRequest{Query: trimmedQuery})
 	if marshalErr != nil {
 		return session.ExecutionResult{}, fmt.Errorf("failed to marshal BYDBQL request: %w", marshalErr)
@@ -362,6 +421,7 @@ func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session
 	if requestErr != nil {
 		executionResult := session.ExecutionResult{
 			CheckedAt: executor.now(),
+			Duration:  time.Since(requestStartedAt),
 			Query:     trimmedQuery,
 			Command:   "POST " + bydbqlQueryPath,
 			Path:      bydbqlQueryPath,
@@ -372,6 +432,7 @@ func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session
 	rawResponse := strings.TrimSpace(string(response.Body()))
 	executionResult := session.ExecutionResult{
 		CheckedAt: executor.now(),
+		Duration:  time.Since(requestStartedAt),
 		Query:     trimmedQuery,
 		Command:   "POST " + bydbqlQueryPath,
 		Path:      bydbqlQueryPath,
@@ -388,6 +449,8 @@ func (executor *HTTPExecutor) Execute(ctx context.Context, querySession *session
 	}
 	rows, resultType := responseRows(queryResponse)
 	executionResult.Rows = rows
+	executionResult.ResourceType = resultType
+	executionResult.Columns, executionResult.Preview, executionResult.Truncated = responsePreview(response.Body(), executor.limits.PreviewRows)
 	executionResult.Summary = fmt.Sprintf("executed %s BYDBQL query through %s; rows=%d", resultType, bydbqlQueryPath, rows)
 	if rows == 0 {
 		executionResult.Hint = "query returned zero rows; consider widening the TIME range or verifying resource name, group, and filters"
@@ -770,6 +833,110 @@ func responseRows(response *bydbqlv1.QueryResponse) (int, string) {
 		return rows, "topn"
 	}
 	return 0, "unknown"
+}
+
+func responsePreview(body []byte, maxRows int) ([]string, [][]string, bool) {
+	var value any
+	if unmarshalErr := json.Unmarshal(body, &value); unmarshalErr != nil {
+		return nil, nil, false
+	}
+	items := firstArray(value)
+	if len(items) == 0 {
+		return nil, nil, false
+	}
+	columns := previewColumns(items, maxRows)
+	if len(columns) == 0 {
+		columns = []string{"value"}
+	}
+	previewLength := minimum(len(items), maxRows)
+	preview := make([][]string, 0, previewLength)
+	for _, item := range items[:previewLength] {
+		preview = append(preview, previewRow(item, columns))
+	}
+	return columns, preview, len(items) > previewLength
+}
+
+func firstArray(value any) []any {
+	switch typedValue := value.(type) {
+	case map[string]any:
+		preferredKeys := []string{"dataPoints", "elements", "properties", "traces", "items", "lists"}
+		for _, key := range preferredKeys {
+			if items := firstArray(typedValue[key]); len(items) > 0 {
+				return items
+			}
+		}
+		keys := make([]string, 0, len(typedValue))
+		for key := range typedValue {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if items := firstArray(typedValue[key]); len(items) > 0 {
+				return items
+			}
+		}
+	case []any:
+		return typedValue
+	}
+	return nil
+}
+
+func previewColumns(items []any, maxRows int) []string {
+	columnSet := make(map[string]struct{})
+	for _, item := range items[:minimum(len(items), maxRows)] {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		for key := range object {
+			columnSet[key] = struct{}{}
+		}
+	}
+	columns := make([]string, 0, len(columnSet))
+	for column := range columnSet {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	return columns
+}
+
+func previewRow(item any, columns []string) []string {
+	row := make([]string, 0, len(columns))
+	object, objectOK := item.(map[string]any)
+	for _, column := range columns {
+		if !objectOK {
+			row = append(row, previewValue(item))
+			continue
+		}
+		row = append(row, previewValue(object[column]))
+	}
+	return row
+}
+
+func previewValue(value any) string {
+	if stringValue, ok := value.(string); ok {
+		return truncatePreviewValue(stringValue)
+	}
+	encodedValue, marshalErr := json.Marshal(value)
+	if marshalErr != nil {
+		return "<unavailable>"
+	}
+	return truncatePreviewValue(string(encodedValue))
+}
+
+func truncatePreviewValue(value string) string {
+	runes := []rune(value)
+	if len(runes) <= maxPreviewCellRunes {
+		return value
+	}
+	return string(runes[:maxPreviewCellRunes-3]) + "..."
+}
+
+func minimum(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func truncateBody(value string) string {

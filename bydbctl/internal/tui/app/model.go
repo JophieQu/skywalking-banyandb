@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -29,8 +30,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
-	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/applog"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/workflow"
@@ -57,68 +59,71 @@ const (
 
 // Config configures the TUI model.
 type Config struct {
-	AgentGateway agent.Gateway
-	Executor     tools.Executor
-	SessionLog   *applog.Logger
-	LogDir       string
-	Provider     string
-	Goal         string
-	ResourceType string
-	ResourceName string
-	Groups       string
-	Start           string
-	End             string
-	MaxRetries      int
-	NameProvided    bool
-	GroupsProvided  bool
-	TypeProvided    bool
+	AgentGateway   agent.Gateway
+	Executor       tools.Executor
+	Approvals      *approval.Controller
+	ToolBridge     *bridge.ToolBridge
+	SessionLog     *applog.Logger
+	LogDir         string
+	Provider       string
+	Goal           string
+	ResourceType   string
+	ResourceName   string
+	Groups         string
+	Start          string
+	End            string
+	NameProvided   bool
+	GroupsProvided bool
+	TypeProvided   bool
 }
 
 // Model is the Bubble Tea state for the bydbctl agent TUI.
 type Model struct {
-	runner         *workflow.Runner
-	executor       tools.Executor
-	querySession   *session.QuerySession
-	catalog        catalogBrowser
-	selectedSchema session.SchemaSnapshot
-	catalogFilter  textinput.Model
-	goal           textarea.Model
-	turnHint       textarea.Model
-	query          textarea.Model
-	resourceName   textinput.Model
-	groups         textinput.Model
-	start          textinput.Model
-	end            textinput.Model
-	resourceType   session.ResourceType
-	provider         string
-	status           string
-	events           []string
-	sessionLog       *applog.Logger
-	logPathDisplay   string
-	width            int
-	height           int
-	catalogHeight    int
-	activeTab        appTab
-	activityLog      []activityEntry
-	activityScroll   int
-	activityCursor   int
-	detailScroll     int
-	focus            int
-	busy             bool
-	typePinned       bool
-	namePinned       bool
-	groupsPinned     bool
+	runner          *workflow.Runner
+	executor        tools.Executor
+	querySession    *session.QuerySession
+	catalog         catalogBrowser
+	selectedSchema  session.SchemaSnapshot
+	catalogFilter   textinput.Model
+	goal            textarea.Model
+	turnHint        textarea.Model
+	query           textarea.Model
+	resourceName    textinput.Model
+	groups          textinput.Model
+	start           textinput.Model
+	end             textinput.Model
+	resourceType    session.ResourceType
+	provider        string
+	status          string
+	events          []string
+	sessionLog      *applog.Logger
+	logPathDisplay  string
+	width           int
+	height          int
+	catalogHeight   int
+	activeTab       appTab
+	activityLog     []activityEntry
+	activityScroll  int
+	activityCursor  int
+	detailScroll    int
+	focus           int
+	busy            bool
+	typePinned      bool
+	namePinned      bool
+	groupsPinned    bool
+	pendingApproval *approval.Request
+	turnCancel      context.CancelFunc
+	turnEvents      []agent.Event
+	liveResponse    string
+	queryRevision   int
 }
 
 // NewModel creates a TUI model with the configured agent gateway.
 func NewModel(config Config) Model {
 	agentGateway := config.AgentGateway
-	if agentGateway == nil {
-		agentGateway = fake.NewGateway()
-	}
 	provider := strings.TrimSpace(config.Provider)
 	if provider == "" {
-		provider = "fake"
+		provider = "unconfigured"
 	}
 	catalogFilter := newTextInput("", "filter groups/resources")
 	catalogFilter.Width = 24
@@ -150,19 +155,20 @@ func NewModel(config Config) Model {
 		runner: workflow.NewRunner(workflow.Config{
 			AgentGateway: agentGateway,
 			Executor:     config.Executor,
-			MaxRetries:   config.MaxRetries,
+			Approvals:    config.Approvals,
+			ToolBridge:   config.ToolBridge,
 		}),
-		executor:     config.Executor,
-		catalog:      newCatalogBrowser(),
-		catalogFilter: catalogFilter,
-		goal:         goal,
-		turnHint:     turnHint,
-		query:        query,
-		resourceName: resourceName,
-		groups:       groups,
-		start:        start,
-		end:          end,
-		resourceType: session.NormalizeResourceType(config.ResourceType),
+		executor:       config.Executor,
+		catalog:        newCatalogBrowser(),
+		catalogFilter:  catalogFilter,
+		goal:           goal,
+		turnHint:       turnHint,
+		query:          query,
+		resourceName:   resourceName,
+		groups:         groups,
+		start:          start,
+		end:            end,
+		resourceType:   session.NormalizeResourceType(config.ResourceType),
 		provider:       provider,
 		status:         "ready",
 		sessionLog:     sessionLog,
@@ -185,7 +191,7 @@ func NewModel(config Config) Model {
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.loadCatalogCmd())
+	return tea.Batch(m.loadCatalogCmd(), m.waitApprovalCmd())
 }
 
 // Update implements tea.Model.
@@ -194,6 +200,63 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.resize(typedMsg.Width, typedMsg.Height)
 		return m, nil
+	case approvalMsg:
+		m.pendingApproval = &typedMsg.request
+		m.status = "execution approval required"
+		m.recordActivity("approval", "approval required", formatApprovalRequest(typedMsg.request))
+		m.logWrite("approval", formatApprovalAudit(typedMsg.request))
+		return m, m.waitApprovalCmd()
+	case agentStartedMsg:
+		if typedMsg.startErr != nil {
+			m.busy = false
+			m.turnCancel = nil
+			m.status = typedMsg.startErr.Error()
+			m.addUIEvent(summarizeError("agent", typedMsg.startErr.Error()))
+			m.logWriteError("agent", typedMsg.startErr)
+			return m, nil
+		}
+		m.liveResponse = ""
+		return m, m.nextAgentUpdateCmd(typedMsg.updates)
+	case agentTurnUpdateMsg:
+		if typedMsg.update.Event != nil {
+			event := *typedMsg.update.Event
+			m.turnEvents = append(m.turnEvents, event)
+			m.recordAgentActivities([]agent.Event{event})
+			if event.Kind == agent.EventKindMessageDelta {
+				m.liveResponse += event.Message
+				m.status = "agent is responding"
+			} else if summary := summarizeAgentEvent(event); summary != "" {
+				m.addUIEvent(summary)
+			}
+		}
+		if !typedMsg.update.Done {
+			return m, m.nextAgentUpdateCmd(typedMsg.updates)
+		}
+		m.busy = false
+		m.turnCancel = nil
+		m.querySession = typedMsg.update.QuerySession
+		m.syncQuerySession()
+		m.logAgentTurn(m.turnEvents)
+		m.turnEvents = nil
+		m.liveResponse = ""
+		if typedMsg.update.Err != nil {
+			m.status = typedMsg.update.Err.Error()
+			m.addUIEvent(summarizeError("agent", typedMsg.update.Err.Error()))
+			m.logWriteError("agent", typedMsg.update.Err)
+			return m, nil
+		}
+		m.turnHint.SetValue("")
+		m.status = "agent turn complete"
+		m.addUIEvent("agent: turn complete")
+		m.logQuerySession(m.querySession)
+		return m, nil
+	case queryDebounceMsg:
+		if typedMsg.revision != m.queryRevision || m.busy || strings.TrimSpace(m.query.Value()) == "" {
+			return m, nil
+		}
+		m.busy = true
+		m.status = "validating edited query"
+		return m, m.validateCmd()
 	case tea.KeyMsg:
 		command, handled := m.handleKey(typedMsg)
 		if handled {
@@ -226,19 +289,10 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case workflowMsg:
 		m.busy = false
+		m.turnCancel = nil
 		if typedMsg.querySession != nil {
 			m.querySession = typedMsg.querySession
-			if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil {
-				m.query.SetValue(currentCandidate.Query)
-			}
-			if m.querySession.AutoMatched {
-				m.resourceName.SetValue(m.querySession.ResourceName)
-				m.groups.SetValue(strings.Join(m.querySession.Groups, ","))
-				m.resourceType = m.querySession.ResourceType
-			}
-			if strings.TrimSpace(m.querySession.SchemaSnapshot.Name) != "" {
-				m.selectedSchema = m.querySession.SchemaSnapshot
-			}
+			m.syncQuerySession()
 		}
 		m.addAgentEvents(typedMsg.events)
 		m.recordAgentActivities(typedMsg.events)
@@ -289,7 +343,7 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View implements tea.Model.
 func (m Model) View() string {
-	contentWidth := clamp(m.width-4, 100, 200)
+	contentWidth := clamp(m.width-4, 48, 200)
 	bodyHeight := clamp(m.height-8, 18, 40)
 	tabBar := m.renderTabBar(contentWidth)
 	var body string
@@ -323,6 +377,83 @@ type workflowMsg struct {
 	switchRunTab  bool
 }
 
+type approvalMsg struct {
+	request approval.Request
+}
+
+type agentStartedMsg struct {
+	updates  <-chan workflow.TurnUpdate
+	startErr error
+}
+
+type agentTurnUpdateMsg struct {
+	update  workflow.TurnUpdate
+	updates <-chan workflow.TurnUpdate
+}
+
+type queryDebounceMsg struct {
+	revision int
+}
+
+func (m Model) waitApprovalCmd() tea.Cmd {
+	requests := m.runner.ApprovalRequests()
+	return func() tea.Msg {
+		request := <-requests
+		return approvalMsg{request: request}
+	}
+}
+
+func (m Model) nextAgentUpdateCmd(updates <-chan workflow.TurnUpdate) tea.Cmd {
+	return func() tea.Msg {
+		update, open := <-updates
+		if !open {
+			return agentTurnUpdateMsg{update: workflow.TurnUpdate{Done: true, Err: fmt.Errorf("agent stream closed unexpectedly")}, updates: updates}
+		}
+		return agentTurnUpdateMsg{update: update, updates: updates}
+	}
+}
+
+func (m Model) queryDebounceCmd(revision int) tea.Cmd {
+	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg {
+		return queryDebounceMsg{revision: revision}
+	})
+}
+
+func (m *Model) syncQuerySession() {
+	if m.querySession == nil {
+		return
+	}
+	if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil {
+		m.query.SetValue(currentCandidate.Query)
+	}
+	if m.querySession.AutoMatched {
+		m.resourceName.SetValue(m.querySession.ResourceName)
+		m.groups.SetValue(strings.Join(m.querySession.Groups, ","))
+		m.resourceType = m.querySession.ResourceType
+	}
+	if strings.TrimSpace(m.querySession.SchemaSnapshot.Name) != "" {
+		m.selectedSchema = m.querySession.SchemaSnapshot
+	}
+}
+
+func formatApprovalRequest(request approval.Request) string {
+	return strings.Join([]string{
+		"statement: " + request.Query,
+		"resource: " + fallback(request.Resource, "-"),
+		"groups: " + fallback(strings.Join(request.Groups, ", "), "-"),
+		"time range: " + fallback(request.TimeRange, "-"),
+		"limit: " + fallback(request.Limit, "-"),
+		"timeout: " + request.Timeout.String(),
+		fmt.Sprintf("preview rows: %d", request.PreviewRows),
+		"source: " + string(request.Source),
+	}, "\n")
+}
+
+func formatApprovalAudit(request approval.Request) string {
+	return fmt.Sprintf("source=%s resource=%s groups=%s time_range=%s limit=%s timeout=%s preview_rows=%d query=%q",
+		request.Source, request.Resource, strings.Join(request.Groups, ","), request.TimeRange, request.Limit, request.Timeout, request.PreviewRows, request.Query)
+}
+
 func newTextInput(value, placeholder string) textinput.Model {
 	input := textinput.New()
 	input.Placeholder = placeholder
@@ -333,8 +464,30 @@ func newTextInput(value, placeholder string) textinput.Model {
 }
 
 func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.pendingApproval != nil {
+		switch keyMsg.String() {
+		case "y":
+			return m.resolvePendingApproval(true)
+		case "n":
+			return m.resolvePendingApproval(false)
+		case "e":
+			request := *m.pendingApproval
+			if _, handled := m.resolvePendingApproval(false); handled {
+				m.cancelActive()
+				m.query.SetValue(request.Query)
+				m.status = "editing rejected statement"
+				m.switchTab(tabQuery)
+				m.focus = focusQuery
+				return m.syncFocus(), true
+			}
+		}
+	}
 	switch keyMsg.String() {
 	case "ctrl+c", "esc":
+		if m.busy || m.pendingApproval != nil {
+			m.cancelActive()
+			return nil, true
+		}
 		return tea.Quit, true
 	case "f1":
 		m.switchTab(tabSchema)
@@ -379,6 +532,19 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		m.cycleTab(delta)
 		return m.syncFocus(), true
+	case "ctrl+left", "ctrl+right":
+		if m.querySession == nil || len(m.querySession.Candidates) == 0 {
+			return nil, true
+		}
+		delta := -1
+		if keyMsg.String() == "ctrl+right" {
+			delta = 1
+		}
+		if m.querySession.SelectCandidate(m.querySession.SelectedCandidateIndex() + delta) {
+			m.syncQuerySession()
+			m.status = "selected candidate version"
+		}
+		return nil, true
 	case "up", "down":
 		if m.activeTab == tabSchema {
 			if m.focus == focusCatalog {
@@ -432,7 +598,9 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		m.status = "asking agent"
 		turnHintValue := strings.TrimSpace(m.turnHint.Value())
 		m.logWrite("action", fmt.Sprintf("ctrl+a agent turn hint=%q", turnHintValue))
-		return m.agentCmd(turnHintValue), true
+		turnCtx, cancelTurn := context.WithCancel(context.Background())
+		m.turnCancel = cancelTurn
+		return m.agentCmd(turnCtx, turnHintValue), true
 	case "ctrl+v":
 		if m.busy {
 			return nil, true
@@ -448,18 +616,60 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		m.busy = true
 		m.status = "executing query"
 		m.logWrite("action", "ctrl+e execute query")
-		return m.executeCmd(), true
-	case "ctrl+x":
-		if m.busy {
+		executeCtx, cancelExecute := context.WithCancel(context.Background())
+		m.turnCancel = cancelExecute
+		return m.executeCmd(executeCtx), true
+	case "ctrl+p":
+		if m.querySession == nil || len(m.querySession.ExecutionResult.Preview) == 0 {
+			m.addUIEvent("execute a query before sharing a preview with the agent")
 			return nil, true
 		}
-		m.busy = true
-		m.status = "accepting query"
-		m.logWrite("action", "ctrl+x accept query")
-		return m.acceptCmd(), true
+		m.querySession.IncludePreview = !m.querySession.IncludePreview
+		if m.querySession.IncludePreview {
+			m.status = "current preview will be shared with the next agent turn"
+		} else {
+			m.status = "current preview will not be shared with the agent"
+		}
+		return nil, true
 	default:
 		return nil, false
 	}
+}
+
+func (m *Model) resolvePendingApproval(approved bool) (tea.Cmd, bool) {
+	if m.pendingApproval == nil {
+		return nil, false
+	}
+	request := *m.pendingApproval
+	m.pendingApproval = nil
+	if resolveErr := m.runner.ResolveApproval(request.ID, approved); resolveErr != nil {
+		m.status = resolveErr.Error()
+		m.addUIEvent(summarizeError("approval", resolveErr.Error()))
+		return nil, true
+	}
+	decision := "rejected"
+	if approved {
+		decision = "approved"
+	}
+	m.status = "execution " + decision
+	m.recordActivity("approval", "execution "+decision, formatApprovalRequest(request))
+	m.logWrite("approval", fmt.Sprintf("id=%s decision=%s", request.ID, decision))
+	return nil, true
+}
+
+func (m *Model) cancelActive() {
+	if m.turnCancel != nil {
+		m.turnCancel()
+		m.turnCancel = nil
+	}
+	m.runner.CancelApprovals()
+	if stopErr := m.runner.StopAgentTurn(context.Background(), m.querySession); stopErr != nil {
+		m.logWriteError("agent", stopErr)
+	}
+	m.pendingApproval = nil
+	m.status = "cancelled"
+	m.busy = false
+	m.addUIEvent("workflow: cancelled")
 }
 
 func (m *Model) syncFocus() tea.Cmd {
@@ -498,7 +708,11 @@ func (m *Model) syncFocus() tea.Cmd {
 }
 
 func (m *Model) updateFocused(teaMsg tea.Msg) tea.Cmd {
+	if m.busy {
+		return nil
+	}
 	var updateCmd tea.Cmd
+	previousQuery := m.query.Value()
 	switch m.focus {
 	case focusCatalog:
 		return nil
@@ -524,23 +738,27 @@ func (m *Model) updateFocused(teaMsg tea.Msg) tea.Cmd {
 	case focusActivity:
 		return nil
 	}
+	if m.focus == focusQuery && previousQuery != m.query.Value() {
+		m.queryRevision++
+		return tea.Batch(updateCmd, m.queryDebounceCmd(m.queryRevision))
+	}
 	return updateCmd
 }
 
 func (m *Model) resize(width, height int) {
 	m.width = width
 	m.height = height
-	contentWidth := clamp(width-4, 100, 200)
+	contentWidth := clamp(width-4, 48, 200)
 	catalogWidth := clamp(contentWidth*28/100, 28, 44)
 	rightWidth := contentWidth - catalogWidth - 4
-	middleWidth := rightWidth * 46 / 100
-	queryWidth := rightWidth - middleWidth - 2
+	middleWidth := maxInt(24, rightWidth*46/100)
+	queryWidth := maxInt(24, rightWidth-middleWidth-2)
 	inputWidth := maxInt(18, middleWidth-18)
 	m.catalogHeight = clamp(height-6, 20, 40)
 	m.catalogFilter.Width = maxInt(12, catalogWidth-8)
-	m.goal.SetWidth(middleWidth - 4)
-	m.turnHint.SetWidth(middleWidth - 4)
-	m.query.SetWidth(queryWidth - 4)
+	m.goal.SetWidth(maxInt(18, middleWidth-4))
+	m.turnHint.SetWidth(maxInt(18, middleWidth-4))
+	m.query.SetWidth(maxInt(18, queryWidth-4))
 	m.resourceName.Width = inputWidth
 	m.groups.Width = inputWidth
 	m.start.Width = inputWidth
@@ -551,35 +769,18 @@ func (m *Model) resize(width, height int) {
 	m.turnHint.SetHeight(2)
 }
 
-func (m Model) agentCmd(turnHintValue string) tea.Cmd {
+func (m Model) agentCmd(ctx context.Context, turnHintValue string) tea.Cmd {
 	runner := m.runner
 	options := m.startOptions()
 	query := m.query.Value()
 	querySession := m.querySession
 	return func() tea.Msg {
-		updatedSession, ensureErr := ensureSession(context.Background(), runner, querySession, options, query)
+		updatedSession, ensureErr := ensureSession(ctx, runner, querySession, options, query)
 		if ensureErr != nil {
-			return workflowMsg{err: ensureErr}
+			return agentStartedMsg{startErr: ensureErr}
 		}
-		events, turnErr := runner.RunAgentTurn(context.Background(), updatedSession, turnHintValue)
-		if turnErr != nil {
-			return workflowMsg{
-				querySession: updatedSession,
-				events:       events,
-				err:          turnErr,
-			}
-		}
-		status := "agent turn complete"
-		if currentCandidate := updatedSession.CurrentCandidate(); currentCandidate != nil && currentCandidate.Validation.Valid {
-			status = "valid candidate ready — Ctrl+V/E/X"
-		}
-		return workflowMsg{
-			querySession:  updatedSession,
-			events:        events,
-			status:        status,
-			clearTurnHint: true,
-			switchRunTab:  true,
-		}
+		updates, startErr := runner.StartAgentTurn(ctx, updatedSession, turnHintValue)
+		return agentStartedMsg{updates: updates, startErr: startErr}
 	}
 }
 
@@ -611,17 +812,17 @@ func (m Model) validateCmd() tea.Cmd {
 	}
 }
 
-func (m Model) executeCmd() tea.Cmd {
+func (m Model) executeCmd(ctx context.Context) tea.Cmd {
 	runner := m.runner
 	options := m.startOptions()
 	query := m.query.Value()
 	querySession := m.querySession
 	return func() tea.Msg {
-		updatedSession, ensureErr := ensureSession(context.Background(), runner, querySession, options, query)
+		updatedSession, ensureErr := ensureSession(ctx, runner, querySession, options, query)
 		if ensureErr != nil {
 			return workflowMsg{err: ensureErr}
 		}
-		if executeErr := runner.ExecuteCurrent(context.Background(), updatedSession); executeErr != nil {
+		if executeErr := runner.ExecuteCurrent(ctx, updatedSession); executeErr != nil {
 			return workflowMsg{
 				querySession: updatedSession,
 				err:          executeErr,
@@ -630,29 +831,6 @@ func (m Model) executeCmd() tea.Cmd {
 		return workflowMsg{
 			querySession: updatedSession,
 			status:       "execution complete",
-		}
-	}
-}
-
-func (m Model) acceptCmd() tea.Cmd {
-	runner := m.runner
-	options := m.startOptions()
-	query := m.query.Value()
-	querySession := m.querySession
-	return func() tea.Msg {
-		updatedSession, ensureErr := ensureSession(context.Background(), runner, querySession, options, query)
-		if ensureErr != nil {
-			return workflowMsg{err: ensureErr}
-		}
-		if acceptErr := runner.AcceptCurrent(updatedSession); acceptErr != nil {
-			return workflowMsg{
-				querySession: updatedSession,
-				err:          acceptErr,
-			}
-		}
-		return workflowMsg{
-			querySession: updatedSession,
-			status:       "query accepted",
 		}
 	}
 }

@@ -20,7 +20,6 @@ package workflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -30,6 +29,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
 	tuibysql "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bydbql"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
@@ -41,7 +42,6 @@ const (
 	defaultTimeStart    = "-30m"
 	defaultLimit        = 10
 	defaultTopN         = 10
-	defaultMaxRetries   = 2
 	maxDiagnosticLength = 360
 )
 
@@ -93,8 +93,9 @@ type Runner struct {
 	agentGateway agent.Gateway
 	validator    Validator
 	executor     tools.Executor
+	approvals    *approval.Controller
+	toolBridge   *bridge.ToolBridge
 	now          func() time.Time
-	maxRetries   int
 }
 
 // Config configures a Runner.
@@ -102,7 +103,8 @@ type Config struct {
 	AgentGateway agent.Gateway
 	Validator    Validator
 	Executor     tools.Executor
-	MaxRetries   int
+	Approvals    *approval.Controller
+	ToolBridge   *bridge.ToolBridge
 }
 
 // NewRunner creates a WorkflowRunner.
@@ -115,17 +117,41 @@ func NewRunner(config Config) *Runner {
 	if executor == nil {
 		executor = tools.NewReadOnlyExecutor()
 	}
-	maxRetries := config.MaxRetries
-	if maxRetries <= 0 {
-		maxRetries = defaultMaxRetries
+	approvals := config.Approvals
+	if approvals == nil {
+		approvals = approval.NewController()
 	}
 	return &Runner{
 		agentGateway: config.AgentGateway,
 		validator:    validator,
 		executor:     executor,
+		approvals:    approvals,
+		toolBridge:   config.ToolBridge,
 		now:          time.Now,
-		maxRetries:   maxRetries,
 	}
+}
+
+// ApprovalRequests returns execution approvals that require a user decision.
+func (runner *Runner) ApprovalRequests() <-chan approval.Request {
+	return runner.approvals.Requests()
+}
+
+// ResolveApproval records a one-time user decision for an execution request.
+func (runner *Runner) ResolveApproval(requestID string, approved bool) error {
+	return runner.approvals.Resolve(requestID, approval.Decision{Approved: approved})
+}
+
+// CancelApprovals rejects all pending execution requests.
+func (runner *Runner) CancelApprovals() {
+	runner.approvals.Cancel()
+}
+
+// TurnUpdate is one real-time agent or controlled-tool event, or the completed turn result.
+type TurnUpdate struct {
+	Event        *agent.Event
+	Err          error
+	Done         bool
+	QuerySession *session.QuerySession
 }
 
 // StartOptions contains user-provided session slots.
@@ -260,11 +286,32 @@ func (runner *Runner) ReviseWithAgent(ctx context.Context, querySession *session
 
 // RunAgentTurn runs one user-facing agent turn with an optional per-round hint.
 func (runner *Runner) RunAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string) ([]agent.Event, error) {
+	updates, startErr := runner.StartAgentTurn(ctx, querySession, turnHint)
+	if startErr != nil {
+		return nil, startErr
+	}
+	var events []agent.Event
+	for update := range updates {
+		if update.Event != nil {
+			events = append(events, *update.Event)
+		}
+		if update.Done {
+			return events, update.Err
+		}
+	}
+	return events, errors.New("agent turn ended without a completion update")
+}
+
+// StartAgentTurn starts one agent turn and streams its visible updates as they arrive.
+func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string) (<-chan TurnUpdate, error) {
 	if querySession == nil {
 		return nil, errors.New("query session is required")
 	}
 	if runner.agentGateway == nil {
 		return nil, errors.New("agent gateway is not configured")
+	}
+	if runner.toolBridge != nil {
+		runner.toolBridge.SetSession(querySession)
 	}
 	querySession.Phase = session.PhaseAgentDraft
 	agentSessionID := strings.TrimSpace(querySession.AgentSessionID)
@@ -294,24 +341,95 @@ func (runner *Runner) RunAgentTurn(ctx context.Context, querySession *session.Qu
 	)
 	hints := ClassifyIntent(querySession)
 	payload := agent.BuildAgentTurnRequest(querySession, hints, templateHint, trimmedTurnHint)
-	turnEvents, turnErr := runner.runAgentTurn(ctx, agentSessionID, payload)
-	if turnErr != nil {
+	agentEvents, sendErr := runner.sendAgentTurn(ctx, agentSessionID, payload)
+	if sendErr != nil {
 		querySession.Phase = session.PhaseError
-		return turnEvents, turnErr
+		return nil, sendErr
 	}
+	updates := make(chan TurnUpdate, 16)
+	go runner.streamAgentTurn(ctx, querySession, trimmedTurnHint, agentEvents, updates)
+	return updates, nil
+}
+
+// StopAgentTurn cancels approvals and asks the provider to stop the active session.
+func (runner *Runner) StopAgentTurn(ctx context.Context, querySession *session.QuerySession) error {
+	runner.CancelApprovals()
+	if runner.toolBridge != nil {
+		runner.toolBridge.Cancel()
+	}
+	if querySession == nil || strings.TrimSpace(querySession.AgentSessionID) == "" || runner.agentGateway == nil {
+		return nil
+	}
+	if stopErr := runner.agentGateway.Stop(ctx, querySession.AgentSessionID); stopErr != nil {
+		return fmt.Errorf("failed to stop agent session: %w", stopErr)
+	}
+	querySession.AgentSessionID = ""
+	querySession.AddTranscript("workflow", "agent turn cancelled", runner.now())
+	return nil
+}
+
+func (runner *Runner) streamAgentTurn(
+	ctx context.Context,
+	querySession *session.QuerySession,
+	turnHint string,
+	agentEvents <-chan agent.Event,
+	updates chan<- TurnUpdate,
+) {
+	defer close(updates)
+	var collectedEvents []agent.Event
+	toolEvents := bridgeEvents(runner.toolBridge)
+	for agentEvents != nil {
+		select {
+		case <-ctx.Done():
+			querySession.Phase = session.PhaseReady
+			updates <- TurnUpdate{Done: true, Err: ctx.Err(), QuerySession: querySession}
+			return
+		case event, open := <-agentEvents:
+			if !open {
+				agentEvents = nil
+				continue
+			}
+			collectedEvents = append(collectedEvents, event)
+			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			if event.Kind == agent.EventKindError {
+				querySession.Phase = session.PhaseError
+				errorValue := event.Err
+				if errorValue == nil {
+					errorValue = fmt.Errorf("agent error: %s", event.Message)
+				}
+				updates <- TurnUpdate{Done: true, Err: errorValue, QuerySession: querySession}
+				return
+			}
+		case event := <-toolEvents:
+			collectedEvents = append(collectedEvents, event)
+			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+		}
+	}
+	completeErr := runner.completeAgentTurn(ctx, querySession, turnHint, collectedEvents)
+	updates <- TurnUpdate{Done: true, Err: completeErr, QuerySession: querySession}
+}
+
+func bridgeEvents(toolBridge *bridge.ToolBridge) <-chan agent.Event {
+	if toolBridge == nil {
+		return nil
+	}
+	return toolBridge.Events()
+}
+
+func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string, turnEvents []agent.Event) error {
 	candidate := RepairFragmentedQuery(finalCandidate(turnEvents))
 	if strings.TrimSpace(candidate) == "" {
 		querySession.Phase = session.PhaseValidate
 		outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
 		if outputSummary == "" {
-			return turnEvents, errors.New("agent returned no BYDBQL candidate and no readable output")
+			return errors.New("agent returned no structured BYDBQL candidate and no readable output")
 		}
-		return turnEvents, fmt.Errorf("agent returned no BYDBQL candidate; agent output: %s", outputSummary)
+		return fmt.Errorf("agent returned no structured BYDBQL candidate; agent output: %s", outputSummary)
 	}
 	validation, validationErr := runner.validator.Validate(ctx, candidate, &querySession.SchemaSnapshot)
 	if validationErr != nil {
 		querySession.Phase = session.PhaseError
-		return turnEvents, fmt.Errorf("failed to validate agent candidate: %w", validationErr)
+		return fmt.Errorf("failed to validate agent candidate: %w", validationErr)
 	}
 	explanation := finalExplanation(turnEvents)
 	querySession.AddCandidate(session.BydbqlCandidate{
@@ -323,7 +441,7 @@ func (runner *Runner) RunAgentTurn(ctx context.Context, querySession *session.Qu
 		Validation:  validation,
 	})
 	querySession.AddConversationTurn(session.ConversationTurn{
-		Hint:      trimmedTurnHint,
+		Hint:      turnHint,
 		Response:  explanation,
 		Candidate: candidate,
 		CreatedAt: runner.now(),
@@ -331,10 +449,10 @@ func (runner *Runner) RunAgentTurn(ctx context.Context, querySession *session.Qu
 	querySession.AddTranscript("agent", explanation, runner.now())
 	if validation.Valid {
 		querySession.Phase = session.PhaseReady
-		return turnEvents, nil
+		return nil
 	}
 	querySession.Phase = session.PhaseValidate
-	return turnEvents, nil
+	return nil
 }
 
 // ValidateManualQuery validates an edited BYDBQL query and records it as a manual candidate.
@@ -364,7 +482,7 @@ func (runner *Runner) ValidateManualQuery(ctx context.Context, querySession *ses
 	return nil
 }
 
-// ExecuteCurrent runs the current BYDBQL candidate through the workflow-owned tool executor.
+// ExecuteCurrent asks for approval and then runs the exact current BYDBQL candidate once.
 func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.QuerySession) error {
 	if querySession == nil {
 		return errors.New("query session is required")
@@ -377,7 +495,29 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 		querySession.Phase = session.PhaseValidate
 		return errors.New("only a valid BYDBQL candidate can be executed")
 	}
-	executionResult, executeErr := runner.executor.Execute(ctx, querySession, currentCandidate.Query)
+	query := currentCandidate.Query
+	decision, approvalErr := runner.approvals.Request(ctx, runner.executionApproval(querySession, query, approval.SourceManual))
+	if approvalErr != nil {
+		querySession.Phase = session.PhaseReady
+		return fmt.Errorf("execution approval did not complete: %w", approvalErr)
+	}
+	if !decision.Approved {
+		querySession.Phase = session.PhaseReady
+		querySession.AddTranscript("workflow", "execution rejected", runner.now())
+		return errors.New("execution rejected")
+	}
+	validation, validationErr := runner.validator.Validate(ctx, query, &querySession.SchemaSnapshot)
+	if validationErr != nil {
+		querySession.Phase = session.PhaseError
+		return fmt.Errorf("failed to revalidate approved query: %w", validationErr)
+	}
+	currentCandidate.Validation = validation
+	querySession.Validation = validation
+	if !validation.Valid {
+		querySession.Phase = session.PhaseValidate
+		return fmt.Errorf("approved query failed revalidation: %s", validation.Message)
+	}
+	executionResult, executeErr := runner.executor.Execute(ctx, querySession, query)
 	if executeErr != nil {
 		querySession.Phase = session.PhaseError
 		executionResult.Error = executeErr.Error()
@@ -396,28 +536,10 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 	return nil
 }
 
-// AcceptCurrent accepts the newest valid BYDBQL candidate.
-func (runner *Runner) AcceptCurrent(querySession *session.QuerySession) error {
-	if querySession == nil {
-		return errors.New("query session is required")
-	}
-	currentCandidate := querySession.CurrentCandidate()
-	if currentCandidate == nil {
-		return errors.New("query candidate is required")
-	}
-	if !currentCandidate.Validation.Valid {
-		return errors.New("only a valid BYDBQL candidate can be accepted")
-	}
-	if strings.TrimSpace(querySession.ExecutionResult.Query) == "" {
-		return errors.New("execute the BYDBQL candidate before accepting")
-	}
-	if strings.TrimSpace(querySession.ExecutionResult.Query) != strings.TrimSpace(currentCandidate.Query) {
-		return errors.New("execute the current BYDBQL candidate before accepting")
-	}
-	querySession.AcceptedQuery = currentCandidate.Query
-	querySession.Phase = session.PhaseAccepted
-	querySession.AddTranscript("workflow", "accepted BYDBQL candidate", runner.now())
-	return nil
+func (runner *Runner) executionApproval(querySession *session.QuerySession, query string, source approval.Source) approval.Request {
+	resource := fmt.Sprintf("%s/%s", querySession.ResourceType, querySession.ResourceName)
+	limits := tools.Limits(runner.executor)
+	return approval.WithLimits(approval.NewRequest(query, resource, querySession.Groups, source), limits.Timeout, limits.PreviewRows)
 }
 
 // BuildTemplateQuery creates the deterministic starter query for a resource.
@@ -438,7 +560,7 @@ func BuildTemplateQuery(resourceType session.ResourceType, resourceName string, 
 	}
 }
 
-func (runner *Runner) runAgentTurn(ctx context.Context, agentSessionID string, payload agent.RequestPayload) ([]agent.Event, error) {
+func (runner *Runner) sendAgentTurn(ctx context.Context, agentSessionID string, payload agent.RequestPayload) (<-chan agent.Event, error) {
 	taskPrompt := "Generate one BYDBQL query from the goal, slots, and schema in the context JSON."
 	if strings.TrimSpace(payload.Candidate) != "" {
 		taskPrompt = "Revise the BYDBQL candidate using validation or execution feedback in the context JSON."
@@ -451,17 +573,7 @@ func (runner *Runner) runAgentTurn(ctx context.Context, agentSessionID string, p
 	if sendErr != nil {
 		return nil, fmt.Errorf("failed to send agent turn: %w", sendErr)
 	}
-	var collectedEvents []agent.Event
-	for event := range events {
-		collectedEvents = append(collectedEvents, event)
-		if event.Kind == agent.EventKindError {
-			if event.Err != nil {
-				return collectedEvents, fmt.Errorf("agent error: %w", event.Err)
-			}
-			return collectedEvents, fmt.Errorf("agent error: %s", event.Message)
-		}
-	}
-	return collectedEvents, nil
+	return events, nil
 }
 
 func inferResourceType(goal string) session.ResourceType {
@@ -514,24 +626,6 @@ func finalCandidate(events []agent.Event) string {
 		if candidate := cleanBydbqlCandidate(events[eventIdx].Candidate); candidate != "" {
 			return candidate
 		}
-		if candidate := extractCandidateFromText(events[eventIdx].Message); candidate != "" {
-			return candidate
-		}
-	}
-	var messages []string
-	for _, event := range events {
-		if event.Kind == agent.EventKindPlanUpdate {
-			continue
-		}
-		if strings.TrimSpace(event.Message) != "" {
-			messages = append(messages, event.Message)
-		}
-	}
-	if candidate := extractCandidateFromText(strings.Join(messages, "\n")); candidate != "" {
-		return candidate
-	}
-	if candidate := extractCandidateFromFragmentedText(agentOutputText(events)); candidate != "" {
-		return candidate
 	}
 	return ""
 }
@@ -594,28 +688,6 @@ func truncateDiagnostic(value string) string {
 
 func singleLine(value string) string {
 	return strings.Join(strings.Fields(value), " ")
-}
-
-func extractCandidateFromText(text string) string {
-	trimmedText := strings.TrimSpace(text)
-	if trimmedText == "" {
-		return ""
-	}
-	if jsonCandidate := extractJSONCandidate(trimmedText); jsonCandidate != "" {
-		return jsonCandidate
-	}
-	if fencedCandidate := extractFencedCandidate(trimmedText); fencedCandidate != "" {
-		return fencedCandidate
-	}
-	return firstBydbqlStatement(trimmedText)
-}
-
-func extractCandidateFromFragmentedText(text string) string {
-	normalizedText := normalizeFragmentedAgentText(text)
-	if normalizedText == strings.TrimSpace(text) {
-		return ""
-	}
-	return extractCandidateFromText(normalizedText)
 }
 
 // RepairFragmentedQuery normalizes ACP fragmented BYDBQL text into a single statement.
@@ -699,119 +771,14 @@ func isLowerAlpha(value string) bool {
 	return true
 }
 
-func extractJSONCandidate(text string) string {
-	var rawValue any
-	if unmarshalErr := json.Unmarshal([]byte(text), &rawValue); unmarshalErr != nil {
-		return ""
-	}
-	return candidateFromJSON(rawValue)
-}
-
-func candidateFromJSON(value any) string {
-	switch typedValue := value.(type) {
-	case map[string]any:
-		for _, key := range []string{"candidate", "bydbql", "BydbQL", "query", "final"} {
-			if candidateText, ok := typedValue[key].(string); ok {
-				if candidate := cleanBydbqlCandidate(candidateText); candidate != "" {
-					return candidate
-				}
-			}
-		}
-		for _, key := range []string{"result", "data", "params"} {
-			if candidate := candidateFromJSON(typedValue[key]); candidate != "" {
-				return candidate
-			}
-		}
-	case []any:
-		for _, item := range typedValue {
-			if candidate := candidateFromJSON(item); candidate != "" {
-				return candidate
-			}
-		}
-	}
-	return ""
-}
-
-func extractFencedCandidate(text string) string {
-	parts := strings.Split(text, "```")
-	for partIdx := 1; partIdx+1 < len(parts); partIdx += 2 {
-		part := strings.TrimSpace(parts[partIdx])
-		lines := strings.Split(part, "\n")
-		if len(lines) > 1 && !looksLikeBydbql(lines[0]) {
-			part = strings.TrimSpace(strings.Join(lines[1:], "\n"))
-		}
-		if candidate := cleanBydbqlCandidate(part); candidate != "" {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func firstBydbqlStatement(text string) string {
-	lines := strings.Split(text, "\n")
-	for lineIdx, line := range lines {
-		trimmedLine := trimToBydbqlStart(line)
-		if !looksLikeBydbql(trimmedLine) {
-			continue
-		}
-		statementLines := []string{trimmedLine}
-		for nextLineIdx := lineIdx + 1; nextLineIdx < len(lines); nextLineIdx++ {
-			nextLine := strings.TrimSpace(lines[nextLineIdx])
-			if nextLine == "" {
-				break
-			}
-			if !isLikelyBydbqlContinuation(nextLine) {
-				break
-			}
-			statementLines = append(statementLines, nextLine)
-		}
-		return cleanBydbqlCandidate(strings.Join(statementLines, "\n"))
-	}
-	return ""
-}
-
-func trimToBydbqlStart(line string) string {
-	trimmedLine := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
-	upperLine := strings.ToUpper(trimmedLine)
-	selectIdx := strings.Index(upperLine, "SELECT ")
-	topNIdx := strings.Index(upperLine, "SHOW TOP ")
-	switch {
-	case selectIdx >= 0 && topNIdx >= 0 && selectIdx < topNIdx:
-		return strings.TrimSpace(trimmedLine[selectIdx:])
-	case selectIdx >= 0 && topNIdx >= 0:
-		return strings.TrimSpace(trimmedLine[topNIdx:])
-	case selectIdx >= 0:
-		return strings.TrimSpace(trimmedLine[selectIdx:])
-	case topNIdx >= 0:
-		return strings.TrimSpace(trimmedLine[topNIdx:])
-	default:
-		return trimmedLine
-	}
-}
-
-func isLikelyBydbqlContinuation(line string) bool {
-	trimmedLine := strings.TrimSpace(line)
-	if strings.HasPrefix(trimmedLine, "```") {
-		return false
-	}
-	lowerLine := strings.ToLower(trimmedLine)
-	for _, prefix := range []string{"explanation:", "note:", "because ", "this query ", "the query "} {
-		if strings.HasPrefix(lowerLine, prefix) {
-			return false
-		}
-	}
-	return true
-}
-
 func cleanBydbqlCandidate(text string) string {
 	candidate := strings.TrimSpace(text)
 	if candidate == "" {
 		return ""
 	}
-	if semicolonIdx := strings.Index(candidate, ";"); semicolonIdx >= 0 {
-		candidate = candidate[:semicolonIdx]
+	if strings.Contains(candidate, ";") {
+		return ""
 	}
-	candidate = strings.TrimSpace(strings.TrimSuffix(candidate, "```"))
 	if !looksLikeBydbql(candidate) {
 		return ""
 	}

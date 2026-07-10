@@ -45,12 +45,22 @@ func TestNewWritesSessionLog(t *testing.T) {
 		t.Fatalf("failed to read log file: %v", readErr)
 	}
 	logContent := string(logBytes)
-	for _, expected := range []string{"agent raw output", "workflow", os.ErrInvalid.Error()} {
+	for _, expected := range []string{"agent_turn", "non_empty_deltas=1", "workflow", os.ErrInvalid.Error()} {
 		if !strings.Contains(logContent, expected) {
 			t.Fatalf("expected log to contain %q:\n%s", expected, logContent)
 		}
 	}
+	if strings.Contains(logContent, "agent raw output") {
+		t.Fatalf("provider output must not be persisted by default:\n%s", logContent)
+	}
 	if !strings.HasPrefix(sessionLog.Path(), filepath.Join(tempDir, "agent-")) {
 		t.Fatalf("unexpected log path: %s", sessionLog.Path())
+	}
+	fileInfo, statErr := os.Stat(sessionLog.Path())
+	if statErr != nil {
+		t.Fatalf("failed to stat session log: %v", statErr)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("unexpected session log permissions: %o", fileInfo.Mode().Perm())
 	}
 }

@@ -33,7 +33,6 @@ const (
 	PhaseValidate   Phase = "validate"
 	PhaseReady      Phase = "ready"
 	PhaseExecuted   Phase = "executed"
-	PhaseAccepted   Phase = "accepted"
 	PhaseError      Phase = "error"
 )
 
@@ -151,15 +150,20 @@ func (vr ValidationReport) Status() string {
 
 // ExecutionResult stores read-only BYDBQL execution output.
 type ExecutionResult struct {
-	CheckedAt time.Time
-	Rows      int
-	Summary   string
-	Query     string
-	Command   string
-	Path      string
-	Response  string
-	Error     string
-	Hint      string
+	CheckedAt    time.Time
+	Duration     time.Duration
+	Rows         int
+	Columns      []string
+	Preview      [][]string
+	Truncated    bool
+	ResourceType string
+	Summary      string
+	Query        string
+	Command      string
+	Path         string
+	Response     string
+	Error        string
+	Hint         string
 }
 
 // TranscriptEntry is one visible agent or workflow event.
@@ -179,23 +183,24 @@ type ConversationTurn struct {
 
 // QuerySession is the workflow contract between the TUI, agent gateway, validator, and tool executor.
 type QuerySession struct {
-	ID              string
-	Phase           Phase
-	UserGoal        string
-	ResourceType    ResourceType
-	ResourceName    string
-	Groups          []string
-	TimeRange       TimeRange
-	SchemaSnapshot  SchemaSnapshot
-	SlotsPinned     bool
-	AutoMatched     bool
-	AgentSessionID  string
-	Conversation    []ConversationTurn
-	Candidates      []BydbqlCandidate
-	Validation      ValidationReport
-	ExecutionResult ExecutionResult
-	AcceptedQuery   string
-	Transcript      []TranscriptEntry
+	ID                string
+	Phase             Phase
+	UserGoal          string
+	ResourceType      ResourceType
+	ResourceName      string
+	Groups            []string
+	TimeRange         TimeRange
+	SchemaSnapshot    SchemaSnapshot
+	SlotsPinned       bool
+	AutoMatched       bool
+	IncludePreview    bool
+	AgentSessionID    string
+	Conversation      []ConversationTurn
+	Candidates        []BydbqlCandidate
+	SelectedCandidate int
+	Validation        ValidationReport
+	ExecutionResult   ExecutionResult
+	Transcript        []TranscriptEntry
 }
 
 // CurrentCandidate returns the newest candidate query.
@@ -203,13 +208,39 @@ func (qs *QuerySession) CurrentCandidate() *BydbqlCandidate {
 	if qs == nil || len(qs.Candidates) == 0 {
 		return nil
 	}
-	return &qs.Candidates[len(qs.Candidates)-1]
+	selectedCandidate := qs.SelectedCandidate
+	if selectedCandidate < 0 || selectedCandidate >= len(qs.Candidates) {
+		selectedCandidate = len(qs.Candidates) - 1
+	}
+	return &qs.Candidates[selectedCandidate]
 }
 
 // AddCandidate appends a candidate and updates the session validation summary.
 func (qs *QuerySession) AddCandidate(candidate BydbqlCandidate) {
 	qs.Candidates = append(qs.Candidates, candidate)
+	qs.SelectedCandidate = len(qs.Candidates) - 1
 	qs.Validation = candidate.Validation
+}
+
+// SelectCandidate makes an existing version the current candidate.
+func (qs *QuerySession) SelectCandidate(index int) bool {
+	if qs == nil || index < 0 || index >= len(qs.Candidates) {
+		return false
+	}
+	qs.SelectedCandidate = index
+	qs.Validation = qs.Candidates[index].Validation
+	return true
+}
+
+// SelectedCandidateIndex returns the current candidate version index.
+func (qs *QuerySession) SelectedCandidateIndex() int {
+	if qs == nil || len(qs.Candidates) == 0 {
+		return -1
+	}
+	if qs.SelectedCandidate < 0 || qs.SelectedCandidate >= len(qs.Candidates) {
+		return len(qs.Candidates) - 1
+	}
+	return qs.SelectedCandidate
 }
 
 // AddConversationTurn appends one user-agent exchange to the session history.
