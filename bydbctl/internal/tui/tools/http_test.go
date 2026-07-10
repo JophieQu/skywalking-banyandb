@@ -101,15 +101,15 @@ func TestHTTPExecutorDiscoverSchema(t *testing.T) {
 				{
 					Name: "default",
 					Tags: []*databasev1.TagSpec{
-						{Name: "service"},
-						{Name: "endpoint"},
+						{Name: "service", Type: databasev1.TagType_TAG_TYPE_STRING},
+						{Name: "endpoint", Type: databasev1.TagType_TAG_TYPE_STRING},
 					},
 				},
 			},
 			Entity: &databasev1.Entity{TagNames: []string{"service"}},
 			Fields: []*databasev1.FieldSpec{
-				{Name: "latency"},
-				{Name: "cpm"},
+				{Name: "latency", FieldType: databasev1.FieldType_FIELD_TYPE_FLOAT},
+				{Name: "cpm", FieldType: databasev1.FieldType_FIELD_TYPE_INT},
 			},
 		}
 		body, marshalErr := protojson.Marshal(&databasev1.MeasureRegistryServiceGetResponse{
@@ -157,6 +157,14 @@ func TestHTTPExecutorDiscoverSchema(t *testing.T) {
 	}
 	if !reflect.DeepEqual(snapshot.Fields, []string{"latency", "cpm"}) {
 		t.Fatalf("unexpected fields: %v", snapshot.Fields)
+	}
+	endpoint, found := snapshot.Column("endpoint")
+	if !found || endpoint.Type != session.SchemaValueTypeString || !endpoint.Indexed {
+		t.Fatalf("unexpected typed endpoint metadata: %+v", endpoint)
+	}
+	latency, found := snapshot.Column("latency")
+	if !found || latency.Type != session.SchemaValueTypeFloat {
+		t.Fatalf("unexpected typed latency metadata: %+v", latency)
 	}
 	if !containsPath(gotPaths, "/api/v1/measure/schema/lists/production") {
 		t.Fatalf("unexpected paths: %v", gotPaths)

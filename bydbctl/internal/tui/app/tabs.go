@@ -65,10 +65,10 @@ func (m Model) footerForTab(width int) string {
 	var commands []string
 	switch m.activeTab {
 	case tabSchema:
-		commands = []string{"f1-f3 or [ ] tabs", "↑↓ browse", "enter select", "/ type", "ctrl+l refresh", "tab focus", "esc quit"}
+		commands = []string{"f1-f3 or [ ] tabs", "↑↓ browse", "enter inspect", "/ type", "ctrl+l refresh", "tab focus", "esc quit"}
 	case tabQuery:
 		commands = []string{
-			"f1-f3 or [ ] tabs", "ctrl+a agent", "ctrl+v validate", "ctrl+e request execution", "ctrl+p share preview",
+			"f1-f3 or [ ] tabs", "ctrl+a agent", "ctrl+v validate", "ctrl+e request execution", "preview up to 50 rows",
 			"ctrl+←/→ versions", "y/n/e approval", "tab focus", "esc stop/quit",
 		}
 	default:
@@ -100,7 +100,7 @@ func (m *Model) cycleTab(delta int) {
 
 func (m Model) isTypingFocus() bool {
 	switch m.focus {
-	case focusGoal, focusTurnHint, focusQuery, focusCatalogFilter, focusResourceName, focusGroups, focusStart, focusEnd:
+	case focusGoal, focusTurnHint, focusQuery, focusCatalogFilter, focusStart, focusEnd:
 		return true
 	default:
 		return false
@@ -112,7 +112,7 @@ func (m Model) focusOrder() []int {
 	case tabSchema:
 		return []int{focusCatalog, focusCatalogFilter}
 	case tabQuery:
-		return []int{focusGoal, focusTurnHint, focusResourceName, focusGroups, focusStart, focusEnd, focusQuery}
+		return []int{focusGoal, focusTurnHint, focusStart, focusEnd, focusQuery}
 	case tabRun:
 		return []int{focusActivity}
 	default:

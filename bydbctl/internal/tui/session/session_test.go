@@ -48,3 +48,21 @@ func TestCandidateSelectionPreservesManualVersionAsTheCurrentBasis(t *testing.T)
 		t.Fatal("expected nonexistent version selection to fail")
 	}
 }
+
+func TestPlannedQueriesAdvanceOnlyAfterTheExactCurrentStatement(t *testing.T) {
+	querySession := &QuerySession{}
+	querySession.SetPlannedQueries([]PlannedQuery{
+		{ID: "first", Query: "SELECT * FROM MEASURE latency IN production TIME > '-30m' LIMIT 10"},
+		{ID: "second", Query: "SELECT * FROM STREAM logs IN production TIME > '-30m' LIMIT 10"},
+	})
+	if querySession.CompletePlannedQuery("SELECT * FROM STREAM logs IN production TIME > '-30m' LIMIT 10") != nil {
+		t.Fatal("unexpectedly advanced a plan with the wrong query")
+	}
+	nextQuery := querySession.CompletePlannedQuery("SELECT * FROM MEASURE latency IN production TIME > '-30m' LIMIT 10")
+	if nextQuery == nil || nextQuery.ID != "second" {
+		t.Fatalf("expected second query after completing first, got %+v", nextQuery)
+	}
+	if !querySession.PlannedQueries[0].Completed {
+		t.Fatal("expected first planned query to be complete")
+	}
+}

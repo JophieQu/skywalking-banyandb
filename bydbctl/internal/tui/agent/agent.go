@@ -102,6 +102,7 @@ type Constraints struct {
 
 // SchemaSummary is the schema subset exposed to an agent.
 type SchemaSummary struct {
+	Columns            []SchemaColumnSummary `json:"columns,omitempty"`
 	Groups             []string              `json:"groups"`
 	Tags               []string              `json:"tags"`
 	Fields             []string              `json:"fields"`
@@ -111,6 +112,14 @@ type SchemaSummary struct {
 	Catalog            []CatalogEntrySummary `json:"catalog,omitempty"`
 	Type               string                `json:"type"`
 	Name               string                `json:"name"`
+}
+
+// SchemaColumnSummary is a typed column contract exposed to an ACP provider.
+type SchemaColumnSummary struct {
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	Type    string `json:"type"`
+	Indexed bool   `json:"indexed,omitempty"`
 }
 
 // TimeRangePayload is the BYDBQL-compatible time range from TUI slots.
@@ -178,6 +187,15 @@ const (
 	EventKindError             EventKind = "error"
 )
 
+// EventOrigin identifies whether an event came from the provider or a trusted bydbctl component.
+type EventOrigin string
+
+// Event origins.
+const (
+	EventOriginProvider   EventOrigin = "provider"
+	EventOriginToolBridge EventOrigin = "tool_bridge"
+)
+
 // EventStatus describes the lifecycle state of a visible agent action.
 type EventStatus string
 
@@ -200,6 +218,7 @@ type Event struct {
 	Candidate     string
 	Explanation   string
 	Permission    string
+	Origin        EventOrigin
 	ToolName      string
 	InputSummary  string
 	OutputSummary string
@@ -221,9 +240,9 @@ func BuildAgentTurnRequest(querySession *session.QuerySession, hints QueryHints,
 	payload.TurnHint = strings.TrimSpace(turnHint)
 	payload.Conversation = conversationSummary(querySession.Conversation)
 	if strings.TrimSpace(payload.Candidate) == "" {
-		payload.Task = "draft_bydbql"
+		payload.Task = "draft_query_plan"
 	} else {
-		payload.Task = "revise_bydbql"
+		payload.Task = "revise_query_plan"
 	}
 	return payload
 }
@@ -231,7 +250,7 @@ func BuildAgentTurnRequest(querySession *session.QuerySession, hints QueryHints,
 // BuildReviseRequest builds the structured request used by the BYDBQL refinement workflow.
 func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, templateHint string) RequestPayload {
 	payload := buildRequestPayload(querySession, hints, templateHint)
-	payload.Task = "revise_bydbql"
+	payload.Task = "revise_query_plan"
 	return payload
 }
 
@@ -250,7 +269,7 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 		executionSummary = &ExecutionSummary{
 			Rows:         querySession.ExecutionResult.Rows,
 			Columns:      append([]string(nil), querySession.ExecutionResult.Columns...),
-			Preview:      previewForProvider(querySession.IncludePreview, querySession.ExecutionResult.Preview),
+			Preview:      previewForProvider(querySession.ExecutionResult.Preview),
 			ResourceType: querySession.ExecutionResult.ResourceType,
 			Duration:     querySession.ExecutionResult.Duration.String(),
 			Query:        querySession.ExecutionResult.Query,
@@ -267,13 +286,14 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 			End:   strings.TrimSpace(querySession.TimeRange.End),
 		},
 		Constraints: Constraints{
-			FinalArtifact:                      "BYDBQL",
+			FinalArtifact:                      "structured_query_plan",
 			ReadOnly:                           true,
 			MustUseSchema:                      true,
 			UserMustEditOrConfirmBeforeExecute: true,
 			MustNotExecuteTools:                false,
 		},
 		Schema: SchemaSummary{
+			Columns:            columnSummary(querySession.SchemaSnapshot.Columns),
 			Type:               querySession.SchemaSnapshot.Type.String(),
 			Name:               querySession.SchemaSnapshot.Name,
 			Groups:             append([]string(nil), querySession.SchemaSnapshot.Groups...),
@@ -296,10 +316,10 @@ func providerExecutionError(executionError string) string {
 	return "BYDBQL execution failed"
 }
 
-const maxProviderPreviewRows = 10
+const maxProviderPreviewRows = 50
 
-func previewForProvider(includePreview bool, preview [][]string) [][]string {
-	if !includePreview || len(preview) == 0 {
+func previewForProvider(preview [][]string) [][]string {
+	if len(preview) == 0 {
 		return nil
 	}
 	previewLength := len(preview)
@@ -311,6 +331,22 @@ func previewForProvider(includePreview bool, preview [][]string) [][]string {
 		sharedPreview = append(sharedPreview, append([]string(nil), row...))
 	}
 	return sharedPreview
+}
+
+func columnSummary(columns []session.SchemaColumn) []SchemaColumnSummary {
+	if len(columns) == 0 {
+		return nil
+	}
+	summary := make([]SchemaColumnSummary, 0, len(columns))
+	for _, column := range columns {
+		summary = append(summary, SchemaColumnSummary{
+			Name:    column.Name,
+			Kind:    string(column.Kind),
+			Type:    string(column.Type),
+			Indexed: column.Indexed,
+		})
+	}
+	return summary
 }
 
 func conversationSummary(turns []session.ConversationTurn) []ConversationTurnPayload {

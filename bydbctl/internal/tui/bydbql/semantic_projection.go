@@ -49,14 +49,45 @@ func validateSchemaIdentifiers(query string, schema *session.SchemaSnapshot) str
 }
 
 func buildKnownIdentifiers(schema *session.SchemaSnapshot) map[string]bool {
-	knownIdentifiers := make(map[string]bool, len(schema.Tags)+len(schema.Fields))
+	knownIdentifiers := make(map[string]bool, len(schema.Tags)+len(schema.Fields)+len(schema.Columns))
+	suffixCounts := make(map[string]int, len(schema.Columns))
 	for _, tagName := range schema.Tags {
-		knownIdentifiers[strings.ToLower(strings.TrimSpace(tagName))] = true
+		addKnownIdentifier(knownIdentifiers, tagName)
 	}
 	for _, fieldName := range schema.Fields {
-		knownIdentifiers[strings.ToLower(strings.TrimSpace(fieldName))] = true
+		addKnownIdentifier(knownIdentifiers, fieldName)
+	}
+	for _, column := range schema.Columns {
+		addKnownIdentifier(knownIdentifiers, column.Name)
+		suffix := identifierSuffix(column.Name)
+		if suffix != "" {
+			suffixCounts[suffix]++
+		}
+	}
+	for _, column := range schema.Columns {
+		suffix := identifierSuffix(column.Name)
+		if suffixCounts[suffix] == 1 {
+			knownIdentifiers[suffix] = true
+		}
 	}
 	return knownIdentifiers
+}
+
+func addKnownIdentifier(identifiers map[string]bool, value string) {
+	trimmedValue := strings.TrimSpace(value)
+	if trimmedValue == "" {
+		return
+	}
+	identifiers[strings.ToLower(trimmedValue)] = true
+}
+
+func identifierSuffix(identifier string) string {
+	trimmedIdentifier := strings.TrimSpace(identifier)
+	lastDot := strings.LastIndex(trimmedIdentifier, ".")
+	if lastDot < 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(trimmedIdentifier[lastDot+1:]))
 }
 
 func schemaIdentifierList(schema *session.SchemaSnapshot) []string {

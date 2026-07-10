@@ -1,6 +1,6 @@
 # BYDBQL Agent TUI
 
-`bydbctl agent` is a three-page terminal workspace for discovering BanyanDB schemas, drafting BYDBQL with an ACP agent, and safely running approved queries.
+`bydbctl agent` is a three-page terminal workspace where an ACP agent discovers BanyanDB schemas, proposes typed query plans, and safely runs approved queries.
 
 The default provider is `codex-acp`. It starts `@agentclientprotocol/codex-acp` through `npx`; a different ACP-compatible stdio command can be selected with `--agent acp --acp-command …`.
 
@@ -9,10 +9,7 @@ The default provider is `codex-acp`. It starts `@agentclientprotocol/codex-acp` 
 ```shell
 bydbctl agent \
   --addr http://localhost:17913 \
-  --goal "top slow payment endpoints in the last 30 minutes" \
-  --groups sw_metrics \
-  --resource-type MEASURE \
-  --name service_endpoint_latency
+  --goal "top slow payment endpoints in the last 30 minutes"
 ```
 
 For a custom ACP provider:
@@ -36,12 +33,15 @@ Each TUI session creates a private, local MCP bridge. It exposes exactly these t
 
 - `list_groups_schemas`
 - `describe_schema`
+- `propose_query_plan`
 - `validate_bydbql`
 - `execute_bydbql`
 
-Schema discovery and validation can run automatically. The bridge rejects every other tool, shell command, external MCP server, dynamic registration, and download. The legacy `--mcp-config` option is retained only to produce an explicit error; external MCP injection is not supported. The old `codex-exec` provider is removed. The deterministic `fake` provider is test-only and is not a CLI provider.
+The Agent starts with no selected schema. It ranks catalog candidates, inspects at most three detailed schemas, and selects a resource only when its typed metadata supports the request. If the best choices remain ambiguous, it asks one focused clarification question. The Schema page is read-only and cannot pin a resource.
 
-An agent must publish a candidate through the structured `validate_bydbql` tool call. bydbctl deliberately does not extract a statement from Markdown, JSON, or free-form provider text.
+`propose_query_plan` accepts a strict JSON plan and uses typed local metadata to render final BYDBQL. The planner supports projections, comparison/`IN` filters with `AND`/`OR`, indexed ordering, Measure aggregation/grouping, and `SHOW TOP`. It rejects `MATCH`, `HAVING`, `OFFSET`, `STAGES`, `WITH QUERY_TRACE`, joins, and unknown column types rather than guessing. `validate_bydbql` remains for manual editor checks; it cannot publish a provider candidate. The bridge rejects every other tool, shell command, external MCP server, dynamic registration, and download.
+
+The legacy `--mcp-config` option is retained only to produce an explicit error; external MCP injection is not supported. The old `codex-exec` provider is removed. The deterministic `fake` provider is test-only and is not a CLI provider. ACP providers that cannot use the controlled plan tool fail instead of falling back to free-text BYDBQL.
 
 ## Execution approval
 
@@ -51,7 +51,7 @@ No query runs merely because the agent generated it. `execute_bydbql` and the ma
 - `n` rejects it.
 - `e` rejects it, stops the active turn, and copies the statement into the editor for revision.
 
-Any changed statement requires a new approval. The card also shows the effective query timeout and local preview bound. Configure these with `--query-timeout` and `--preview-rows`. Immediately after approval, bydbctl validates the exact statement again; failed revalidation prevents execution. Queries are never retried automatically. `Esc` or `Ctrl+C` stops an active agent/query operation, rejects pending approvals, and retains the activity and candidate history.
+Any changed statement requires a new approval. The card also shows the effective query timeout and the fixed 50-row local preview bound. Immediately after approval, bydbctl validates the exact statement again; failed revalidation prevents execution. A failed execution never retries automatically, but its sanitized feedback can produce a new, separately approved plan. `Esc` or `Ctrl+C` stops an active agent/query operation, rejects pending approvals, and retains the activity and candidate history.
 
 The local semantic checks require a `TIME` clause for time-series queries and a `LIMIT` for `SELECT` queries. These checks complement BanyanDB execution and do not grant the provider permission to access data.
 
@@ -59,7 +59,7 @@ The local semantic checks require a `TIME` clause for time-series queries and a 
 
 | Page | Key | Purpose |
 | --- | --- | --- |
-| Schema | F1 | Browse groups and resources, inspect tags/fields/indexes, select a resource |
+| Schema | F1 | Review catalog candidates, inspected schemas, typed columns, and the Agent's selected evidence |
 | Query / Agent | F2 | Multi-turn conversation, current BYDBQL version, validation and approval |
 | Run / Activity | F3 | Structured result preview and live plan/tool/approval/execution activity |
 
@@ -80,7 +80,7 @@ Editing the query creates a manual candidate. The editor performs a short deboun
 
 The Run page shows resource type, duration, row count, and a bounded structured table preview. The raw HTTP response remains available only in the current process as a detail view. It is neither sent to the ACP provider nor written to the normal session log.
 
-When a user asks a later question, bydbctl supplies the provider only the current statement, result type, row count, duration, column summary, and error. It does not automatically trigger a follow-up agent turn after execution. Press `Ctrl+P` to explicitly attach a bounded subset of the current table preview to the next agent turn; press it again to turn sharing off.
+When a user asks a later question, or when a workflow advances to a dependent planned query, bydbctl supplies the provider the current statement, result type, row count, duration, column summary, error, and up to 50 preview rows. No extra sharing option is required. A multi-resource goal is represented as multiple independently compiled and approved queries; BanyanDB joins are never fabricated.
 
 ## Activity log and persistence
 
@@ -92,5 +92,5 @@ Session logs are stored in `$HOME/.bydbctl/logs` by default (override with `--lo
 
 - If ACP cannot start, check the selected ACP command and its local login/runtime prerequisites. `codex-acp` requires `npx` and the Codex ACP package.
 - If schema discovery fails, verify the normal bydbctl address, authentication, TLS, certificate, and server permissions.
-- If no candidate appears, inspect the Activity page. The provider must call `validate_bydbql`; a statement embedded in chat text is intentionally ignored.
+- If no candidate appears, inspect the Activity page. The provider must call `propose_query_plan`; a BYDBQL statement embedded in chat text is intentionally ignored.
 - If an approval fails after `y`, review the local revalidation error, update the query, and request approval again.

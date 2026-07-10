@@ -256,6 +256,7 @@ func (executor *HTTPExecutor) DiscoverSchema(ctx context.Context, req SchemaRequ
 	}
 	if indexedTags, indexErr := executor.discoverResourceIndexedTags(ctx, group, req.Type, req.Name); indexErr == nil {
 		schemaSnapshot.IndexedFields = indexedTags
+		schemaSnapshot.Columns = markIndexedColumns(schemaSnapshot.Columns, indexedTags)
 	}
 	return schemaSnapshot, nil
 }
@@ -618,6 +619,7 @@ func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (sessi
 		base.Tags = tagFamilies(measure.GetTagFamilies())
 		base.EntityTags = entityTagNames(measure.GetEntity())
 		base.Fields = fieldNames(measure.GetFields())
+		base.Columns = append(tagFamilyColumns(measure.GetTagFamilies()), fieldColumns(measure.GetFields())...)
 		return base, nil
 	case session.ResourceTypeStream:
 		stream, parseErr := parseStreamSchema(body)
@@ -626,6 +628,7 @@ func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (sessi
 		}
 		base.Tags = tagFamilies(stream.GetTagFamilies())
 		base.EntityTags = entityTagNames(stream.GetEntity())
+		base.Columns = tagFamilyColumns(stream.GetTagFamilies())
 		return base, nil
 	case session.ResourceTypeTrace:
 		trace, parseErr := parseTraceSchema(body)
@@ -633,6 +636,7 @@ func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (sessi
 			return session.SchemaSnapshot{}, parseErr
 		}
 		base.Tags = traceTagNames(trace.GetTags())
+		base.Columns = traceTagColumns(trace.GetTags())
 		return base, nil
 	case session.ResourceTypeProperty:
 		property, parseErr := parsePropertySchema(body)
@@ -640,6 +644,7 @@ func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (sessi
 			return session.SchemaSnapshot{}, parseErr
 		}
 		base.Tags = tagNames(property.GetTags())
+		base.Columns = tagColumns(property.GetTags(), session.SchemaColumnTag)
 		return base, nil
 	case session.ResourceTypeTopN:
 		topN, parseErr := parseTopNSchema(body)
@@ -648,6 +653,12 @@ func summarizeSchema(req SchemaRequest, body []byte, updatedAt time.Time) (sessi
 		}
 		base.Tags = append([]string(nil), topN.GetGroupByTagNames()...)
 		base.Fields = compactStrings([]string{topN.GetFieldName()})
+		for _, tagName := range base.Tags {
+			base.Columns = append(base.Columns, session.SchemaColumn{Name: tagName, Kind: session.SchemaColumnTag})
+		}
+		if fieldName := strings.TrimSpace(topN.GetFieldName()); fieldName != "" {
+			base.Columns = append(base.Columns, session.SchemaColumn{Name: fieldName, Kind: session.SchemaColumnField})
+		}
 		return base, nil
 	default:
 		return session.SchemaSnapshot{}, fmt.Errorf("unsupported resource type: %s", req.Type)
@@ -758,6 +769,28 @@ func tagFamilies(families []*databasev1.TagFamilySpec) []string {
 	return compactStrings(tags)
 }
 
+func tagFamilyColumns(families []*databasev1.TagFamilySpec) []session.SchemaColumn {
+	var columns []session.SchemaColumn
+	for _, family := range families {
+		familyName := strings.TrimSpace(family.GetName())
+		for _, tag := range family.GetTags() {
+			tagName := strings.TrimSpace(tag.GetName())
+			if tagName == "" {
+				continue
+			}
+			if familyName != "" {
+				tagName = familyName + "." + tagName
+			}
+			columns = append(columns, session.SchemaColumn{
+				Name: tagName,
+				Kind: session.SchemaColumnTag,
+				Type: tagValueType(tag.GetType()),
+			})
+		}
+	}
+	return columns
+}
+
 func entityTagNames(entity *databasev1.Entity) []string {
 	if entity == nil {
 		return nil
@@ -773,6 +806,18 @@ func tagNames(tags []*databasev1.TagSpec) []string {
 	return compactStrings(names)
 }
 
+func tagColumns(tags []*databasev1.TagSpec, kind session.SchemaColumnKind) []session.SchemaColumn {
+	columns := make([]session.SchemaColumn, 0, len(tags))
+	for _, tag := range tags {
+		tagName := strings.TrimSpace(tag.GetName())
+		if tagName == "" {
+			continue
+		}
+		columns = append(columns, session.SchemaColumn{Name: tagName, Kind: kind, Type: tagValueType(tag.GetType())})
+	}
+	return columns
+}
+
 func traceTagNames(tags []*databasev1.TraceTagSpec) []string {
 	var names []string
 	for _, tag := range tags {
@@ -781,12 +826,99 @@ func traceTagNames(tags []*databasev1.TraceTagSpec) []string {
 	return compactStrings(names)
 }
 
+func traceTagColumns(tags []*databasev1.TraceTagSpec) []session.SchemaColumn {
+	columns := make([]session.SchemaColumn, 0, len(tags))
+	for _, tag := range tags {
+		tagName := strings.TrimSpace(tag.GetName())
+		if tagName == "" {
+			continue
+		}
+		columns = append(columns, session.SchemaColumn{
+			Name: tagName,
+			Kind: session.SchemaColumnTag,
+			Type: tagValueType(tag.GetType()),
+		})
+	}
+	return columns
+}
+
 func fieldNames(fields []*databasev1.FieldSpec) []string {
 	var names []string
 	for _, field := range fields {
 		names = append(names, field.GetName())
 	}
 	return compactStrings(names)
+}
+
+func fieldColumns(fields []*databasev1.FieldSpec) []session.SchemaColumn {
+	columns := make([]session.SchemaColumn, 0, len(fields))
+	for _, field := range fields {
+		fieldName := strings.TrimSpace(field.GetName())
+		if fieldName == "" {
+			continue
+		}
+		columns = append(columns, session.SchemaColumn{
+			Name: fieldName,
+			Kind: session.SchemaColumnField,
+			Type: fieldValueType(field.GetFieldType()),
+		})
+	}
+	return columns
+}
+
+func markIndexedColumns(columns []session.SchemaColumn, indexedFields []string) []session.SchemaColumn {
+	indexedColumns := append([]session.SchemaColumn(nil), columns...)
+	for columnIndex := range indexedColumns {
+		for _, indexedField := range indexedFields {
+			if matchesColumnName(indexedColumns[columnIndex].Name, indexedField) {
+				indexedColumns[columnIndex].Indexed = true
+				break
+			}
+		}
+	}
+	return indexedColumns
+}
+
+func matchesColumnName(columnName, requestedName string) bool {
+	if strings.EqualFold(strings.TrimSpace(columnName), strings.TrimSpace(requestedName)) {
+		return true
+	}
+	lastDot := strings.LastIndex(columnName, ".")
+	return lastDot >= 0 && strings.EqualFold(columnName[lastDot+1:], strings.TrimSpace(requestedName))
+}
+
+func tagValueType(tagType databasev1.TagType) session.SchemaValueType {
+	switch tagType {
+	case databasev1.TagType_TAG_TYPE_STRING:
+		return session.SchemaValueTypeString
+	case databasev1.TagType_TAG_TYPE_INT:
+		return session.SchemaValueTypeInt
+	case databasev1.TagType_TAG_TYPE_STRING_ARRAY:
+		return session.SchemaValueTypeStringArray
+	case databasev1.TagType_TAG_TYPE_INT_ARRAY:
+		return session.SchemaValueTypeIntArray
+	case databasev1.TagType_TAG_TYPE_TIMESTAMP:
+		return session.SchemaValueTypeTimestamp
+	case databasev1.TagType_TAG_TYPE_DATA_BINARY:
+		return session.SchemaValueTypeBinary
+	default:
+		return session.SchemaValueTypeUnknown
+	}
+}
+
+func fieldValueType(fieldType databasev1.FieldType) session.SchemaValueType {
+	switch fieldType {
+	case databasev1.FieldType_FIELD_TYPE_STRING:
+		return session.SchemaValueTypeString
+	case databasev1.FieldType_FIELD_TYPE_INT:
+		return session.SchemaValueTypeInt
+	case databasev1.FieldType_FIELD_TYPE_FLOAT:
+		return session.SchemaValueTypeFloat
+	case databasev1.FieldType_FIELD_TYPE_DATA_BINARY:
+		return session.SchemaValueTypeBinary
+	default:
+		return session.SchemaValueTypeUnknown
+	}
 }
 
 func compactStrings(values []string) []string {

@@ -675,7 +675,7 @@ func isControlledToolPermission(params map[string]any) bool {
 		toolName = stringValue(toolCall, "title")
 	}
 	switch toolName {
-	case "list_groups_schemas", "describe_schema", "validate_bydbql", "execute_bydbql":
+	case "list_groups_schemas", "describe_schema", "propose_query_plan", "validate_bydbql", "execute_bydbql":
 		return true
 	default:
 		return false

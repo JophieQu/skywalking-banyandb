@@ -48,13 +48,9 @@ func newAgentCmd() *cobra.Command {
 	var acpArgs []string
 	var mcpConfig string
 	var initialGoal string
-	var initialResourceType string
-	var initialResourceName string
-	var initialGroups string
 	var initialStart string
 	var initialEnd string
 	var queryTimeout time.Duration
-	var previewRows int
 	var logDir string
 	agentCmd := &cobra.Command{
 		Use:     "agent",
@@ -64,22 +60,18 @@ func newAgentCmd() *cobra.Command {
 			if cmd.Flags().Changed("mcp-config") {
 				return fmt.Errorf("--mcp-config is no longer supported: bydbctl agent only exposes its built-in controlled tools")
 			}
-			if initialGroups == "" {
-				initialGroups = viper.GetString("group")
-			}
 			workingDirectory, wdErr := os.Getwd()
 			if wdErr != nil {
 				return fmt.Errorf("failed to get working directory: %w", wdErr)
 			}
 			executor := tools.NewHTTPExecutor(tools.HTTPConfig{
-				Addr:           viper.GetString("addr"),
-				Username:       viper.GetString("username"),
-				Password:       viper.GetString("password"),
-				EnableTLS:      enableTLS,
-				Insecure:       insecure,
-				Cert:           cert,
-				Timeout:        queryTimeout,
-				MaxPreviewRows: previewRows,
+				Addr:      viper.GetString("addr"),
+				Username:  viper.GetString("username"),
+				Password:  viper.GetString("password"),
+				EnableTLS: enableTLS,
+				Insecure:  insecure,
+				Cert:      cert,
+				Timeout:   queryTimeout,
 			})
 			approvals := approval.NewController()
 			toolBridge := bridge.New(bridge.Config{
@@ -110,21 +102,15 @@ func newAgentCmd() *cobra.Command {
 				_ = sessionLog.Close()
 			}()
 			model := tuiapp.NewModel(tuiapp.Config{
-				AgentGateway:   agentGateway,
-				Executor:       executor,
-				Approvals:      approvals,
-				ToolBridge:     toolBridge,
-				SessionLog:     sessionLog,
-				Provider:       agentProvider,
-				Goal:           initialGoal,
-				ResourceType:   initialResourceType,
-				ResourceName:   initialResourceName,
-				Groups:         initialGroups,
-				Start:          initialStart,
-				End:            initialEnd,
-				NameProvided:   initialResourceName != "",
-				GroupsProvided: initialGroups != "",
-				TypeProvided:   cmd.Flags().Changed("resource-type"),
+				AgentGateway: agentGateway,
+				Executor:     executor,
+				Approvals:    approvals,
+				ToolBridge:   toolBridge,
+				SessionLog:   sessionLog,
+				Provider:     agentProvider,
+				Goal:         initialGoal,
+				Start:        initialStart,
+				End:          initialEnd,
 			})
 			program := tea.NewProgram(model, tea.WithAltScreen())
 			if _, runErr := program.Run(); runErr != nil {
@@ -139,13 +125,9 @@ func newAgentCmd() *cobra.Command {
 	agentCmd.Flags().StringArrayVar(&acpArgs, "acp-arg", nil, "argument passed to --acp-command; may be repeated")
 	agentCmd.Flags().StringVar(&mcpConfig, "mcp-config", "", "deprecated: external MCP configuration is rejected")
 	agentCmd.Flags().StringVar(&initialGoal, "goal", "", "initial natural language query goal")
-	agentCmd.Flags().StringVar(&initialResourceType, "resource-type", "MEASURE", "initial resource type: MEASURE, STREAM, TRACE, PROPERTY, or TOPN")
-	agentCmd.Flags().StringVar(&initialResourceName, "name", "", "initial resource name")
-	agentCmd.Flags().StringVar(&initialGroups, "groups", "", "initial group list")
 	agentCmd.Flags().StringVar(&initialStart, "start", "-30m", "initial BYDBQL time start")
 	agentCmd.Flags().StringVar(&initialEnd, "end", "", "initial BYDBQL time end")
 	agentCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 3*time.Second, "timeout for one approved BYDBQL query")
-	agentCmd.Flags().IntVar(&previewRows, "preview-rows", 50, "maximum rows kept in the local result preview")
 	agentCmd.Flags().StringVar(&logDir, "log-dir", "", "directory for agent session logs; default is $HOME/.bydbctl/logs")
 	bindTLSRelatedFlag(agentCmd)
 	return agentCmd

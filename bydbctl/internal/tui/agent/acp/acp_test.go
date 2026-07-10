@@ -98,25 +98,27 @@ func TestNormalizeEventMapsPermissionRequest(t *testing.T) {
 }
 
 func TestPermissionDecisionAllowsOnlyControlledTools(t *testing.T) {
-	decision := permissionDecision(map[string]any{
-		"toolCall": map[string]any{"name": "validate_bydbql"},
-		"options": []any{
-			map[string]any{"optionId": "allow", "kind": "allow_once"},
-			map[string]any{"optionId": "reject", "kind": "reject_once"},
-		},
-	})
-	outcome := mapValue(decision, "outcome")
-	if stringValue(outcome, "optionId") != "allow" {
-		t.Fatalf("expected controlled tool permission to be approved: %+v", decision)
+	for _, toolName := range []string{"validate_bydbql", "propose_query_plan"} {
+		decision := permissionDecision(map[string]any{
+			"toolCall": map[string]any{"name": toolName},
+			"options": []any{
+				map[string]any{"optionId": "allow", "kind": "allow_once"},
+				map[string]any{"optionId": "reject", "kind": "reject_once"},
+			},
+		})
+		outcome := mapValue(decision, "outcome")
+		if stringValue(outcome, "optionId") != "allow" {
+			t.Fatalf("expected controlled tool permission to be approved: %+v", decision)
+		}
 	}
-	decision = permissionDecision(map[string]any{
+	decision := permissionDecision(map[string]any{
 		"toolCall": map[string]any{"name": "shell"},
 		"options": []any{
 			map[string]any{"optionId": "allow", "kind": "allow_once"},
 			map[string]any{"optionId": "reject", "kind": "reject_once"},
 		},
 	})
-	outcome = mapValue(decision, "outcome")
+	outcome := mapValue(decision, "outcome")
 	if stringValue(outcome, "optionId") != "reject" {
 		t.Fatalf("expected external tool permission to be rejected: %+v", decision)
 	}

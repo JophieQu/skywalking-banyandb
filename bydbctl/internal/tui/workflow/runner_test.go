@@ -25,6 +25,7 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 )
 
 func TestSyncSessionUpdatesSlots(t *testing.T) {
@@ -85,6 +86,28 @@ func TestStartSessionDiscoversSchemaWithoutCandidate(t *testing.T) {
 	}
 	if querySession.SchemaSnapshot.Name != "service_latency" {
 		t.Fatalf("unexpected schema snapshot: %+v", querySession.SchemaSnapshot)
+	}
+}
+
+func TestStartSessionLeavesResourceUnresolvedForAutonomousDiscovery(t *testing.T) {
+	executor := &catalogExecutor{catalog: session.SchemaCatalog{
+		Groups: []string{"production"},
+		Entries: []session.CatalogEntry{{
+			Type:  session.ResourceTypeMeasure,
+			Name:  "service_latency",
+			Group: "production",
+		}},
+	}}
+	runner := NewRunner(Config{AgentGateway: fake.NewGateway(), Executor: executor})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{Goal: "show slow endpoints"})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	if querySession.ResourceName != "" || querySession.ResourceType != "" || len(querySession.Groups) != 0 {
+		t.Fatalf("expected no preselected schema, got %+v", querySession)
+	}
+	if len(querySession.SchemaSnapshot.Catalog) != 1 || executor.discoverSchemaCount != 0 {
+		t.Fatalf("expected catalog-only discovery, got session=%+v executor=%+v", querySession.SchemaSnapshot, executor)
 	}
 }
 
@@ -161,6 +184,52 @@ func TestExecuteCurrentRevalidatesAfterApproval(t *testing.T) {
 	}
 	if querySession.ExecutionResult.Query != "" {
 		t.Fatalf("query must not execute after failed revalidation: %+v", querySession.ExecutionResult)
+	}
+}
+
+func TestExecuteCurrentAdvancesOneCompiledWorkflowStep(t *testing.T) {
+	firstQuery := "SELECT * FROM STREAM logs IN production TIME > '-30m' WHERE status = 500 LIMIT 10"
+	secondQuery := "SELECT * FROM STREAM logs IN production TIME > '-30m' WHERE service = 'payment' LIMIT 10"
+	schema := session.SchemaSnapshot{
+		Type:   session.ResourceTypeStream,
+		Name:   "logs",
+		Groups: []string{"production"},
+		Columns: []session.SchemaColumn{
+			{Name: "service", Kind: session.SchemaColumnTag, Type: session.SchemaValueTypeString},
+			{Name: "status", Kind: session.SchemaColumnTag, Type: session.SchemaValueTypeInt},
+		},
+	}
+	executor := &catalogExecutor{schema: schema, result: session.ExecutionResult{Rows: 1, Summary: "one row"}}
+	validator := &sequenceValidator{reports: []session.ValidationReport{
+		{Valid: true, QueryType: "STREAM"},
+		{Valid: true, QueryType: "STREAM"},
+	}}
+	runner := NewRunner(Config{AgentGateway: fake.NewGateway(), Executor: executor, Validator: validator})
+	querySession := &session.QuerySession{
+		Phase:          session.PhaseReady,
+		ResourceType:   session.ResourceTypeStream,
+		ResourceName:   "logs",
+		Groups:         []string{"production"},
+		SchemaSnapshot: schema,
+		PlannedQueries: []session.PlannedQuery{
+			{ID: "first", Query: firstQuery, ResourceType: session.ResourceTypeStream, Name: "logs", Groups: []string{"production"}},
+			{ID: "second", Query: secondQuery, ResourceType: session.ResourceTypeStream, Name: "logs", Groups: []string{"production"}},
+		},
+	}
+	querySession.AddCandidate(session.BydbqlCandidate{Query: firstQuery, Validation: session.ValidationReport{Valid: true, QueryType: "STREAM"}})
+	if executeErr := executeAfterApproval(t, runner, querySession); executeErr != nil {
+		t.Fatalf("ExecuteCurrent returned error: %v", executeErr)
+	}
+	if querySession.Phase != session.PhaseReady {
+		t.Fatalf("expected next workflow statement to be ready, got %s", querySession.Phase)
+	}
+	nextPlanStep := querySession.CurrentPlannedQuery()
+	if nextPlanStep == nil || nextPlanStep.ID != "second" {
+		t.Fatalf("expected second plan step, got %+v", nextPlanStep)
+	}
+	nextCandidate := querySession.CurrentCandidate()
+	if nextCandidate == nil || nextCandidate.Query != secondQuery || !nextCandidate.Validation.Valid {
+		t.Fatalf("expected valid second candidate, got %+v", nextCandidate)
 	}
 }
 
@@ -316,6 +385,43 @@ func TestFinalCandidateDoesNotInferFromClaudeACPMessageFragments(t *testing.T) {
 	}
 }
 
+func TestFinalCandidateAcceptsOnlyControlledPlanProposals(t *testing.T) {
+	query := "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10"
+	if candidate := finalCandidate([]agent.Event{{Kind: agent.EventKindCandidate, Candidate: query, ToolName: "validate_bydbql"}}); candidate != "" {
+		t.Fatalf("unexpected raw candidate acceptance: %s", candidate)
+	}
+	if candidate := finalCandidate([]agent.Event{{Kind: agent.EventKindCandidate, Candidate: query, ToolName: "propose_query_plan"}}); candidate != "" {
+		t.Fatalf("unexpected provider proposal spoof acceptance: %s", candidate)
+	}
+	candidate := finalCandidate([]agent.Event{{
+		Kind:      agent.EventKindCandidate,
+		Candidate: query,
+		Origin:    agent.EventOriginToolBridge,
+		ToolName:  "propose_query_plan",
+	}})
+	if candidate != query {
+		t.Fatalf("expected controlled proposal candidate, got %q", candidate)
+	}
+}
+
+func TestDrainBridgeEventsRetainsProposalAfterAgentStreamCloses(t *testing.T) {
+	toolEvents := make(chan agent.Event, 1)
+	toolEvents <- agent.Event{
+		Kind:      agent.EventKindCandidate,
+		Origin:    agent.EventOriginToolBridge,
+		ToolName:  "propose_query_plan",
+		Candidate: "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10",
+	}
+	updates := make(chan TurnUpdate, 1)
+	events := drainBridgeEvents(toolEvents, &session.QuerySession{}, updates, nil)
+	if len(events) != 1 || finalCandidate(events) == "" {
+		t.Fatalf("expected drained proposal event, got %+v", events)
+	}
+	if update := <-updates; update.Event == nil || update.Event.ToolName != "propose_query_plan" {
+		t.Fatalf("unexpected streamed bridge update: %+v", update)
+	}
+}
+
 func TestReviseWithAgentRejectsCandidateEmbeddedInJSONMessage(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
@@ -374,7 +480,9 @@ func TestReviseWithAgentKeepsInvalidCandidateForNextTurn(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
-				Kind:      agent.EventKindFinalResponse,
+				Kind:      agent.EventKindCandidate,
+				Origin:    agent.EventOriginToolBridge,
+				ToolName:  "propose_query_plan",
 				Candidate: "SELECT * FROM STREAM sw IN default WHERE",
 			},
 		},
@@ -414,7 +522,12 @@ func TestReviseWithAgentKeepsInvalidCandidateForNextTurn(t *testing.T) {
 func TestStartAgentTurnStreamsEventsBeforeCompletion(t *testing.T) {
 	gateway := scriptedGateway{events: []agent.Event{
 		{Kind: agent.EventKindPlanUpdate, Message: "inspect schema"},
-		{Kind: agent.EventKindCandidate, Candidate: "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10"},
+		{
+			Kind:      agent.EventKindCandidate,
+			Origin:    agent.EventOriginToolBridge,
+			ToolName:  "propose_query_plan",
+			Candidate: "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10",
+		},
 		{Kind: agent.EventKindFinalResponse, Message: "candidate ready"},
 	}}
 	runner := NewRunner(Config{AgentGateway: gateway})
@@ -451,7 +564,9 @@ func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
-				Kind:      agent.EventKindFinalResponse,
+				Kind:      agent.EventKindCandidate,
+				Origin:    agent.EventOriginToolBridge,
+				ToolName:  "propose_query_plan",
 				Candidate: "SELECT * FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10",
 			},
 		},
@@ -537,6 +652,26 @@ func executeAfterApproval(t *testing.T, runner *Runner, querySession *session.Qu
 		t.Fatalf("failed to approve execution: %v", resolveErr)
 	}
 	return <-executeErrCh
+}
+
+type catalogExecutor struct {
+	catalog             session.SchemaCatalog
+	schema              session.SchemaSnapshot
+	result              session.ExecutionResult
+	discoverSchemaCount int
+}
+
+func (executor *catalogExecutor) DiscoverCatalog(_ context.Context) (session.SchemaCatalog, error) {
+	return executor.catalog, nil
+}
+
+func (executor *catalogExecutor) DiscoverSchema(_ context.Context, _ tools.SchemaRequest) (session.SchemaSnapshot, error) {
+	executor.discoverSchemaCount++
+	return executor.schema, nil
+}
+
+func (executor *catalogExecutor) Execute(_ context.Context, _ *session.QuerySession, _ string) (session.ExecutionResult, error) {
+	return executor.result, nil
 }
 
 type sequenceValidator struct {

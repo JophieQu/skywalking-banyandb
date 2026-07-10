@@ -28,7 +28,7 @@ func TestBuildBydbqlPromptIncludesOutputContract(t *testing.T) {
 	prompt, promptErr := BuildBydbqlPrompt(TurnRequest{
 		Prompt: "Generate a query.",
 		Payload: RequestPayload{
-			Task:      "revise_bydbql",
+			Task:      "revise_query_plan",
 			Goal:      "top slow endpoints",
 			Candidate: "",
 			Schema: SchemaSummary{
@@ -46,12 +46,12 @@ func TestBuildBydbqlPromptIncludesOutputContract(t *testing.T) {
 		t.Fatalf("BuildBydbqlPrompt returned error: %v", promptErr)
 	}
 	for _, expected := range []string{
-		"BYDBQL generation specialist",
-		"Use validate_bydbql with the complete candidate",
-		"Do not rely on Markdown, JSON, or prose",
+		"query-planning specialist",
+		"propose_query_plan",
+		"Never write, validate, or publish a raw BYDBQL statement",
 		"Context JSON:",
 		"top slow endpoints",
-		"Use only the four provided bydbctl tools",
+		"Use only the five provided bydbctl tools",
 		"time_range",
 	} {
 		if !strings.Contains(prompt, expected) {
@@ -60,7 +60,7 @@ func TestBuildBydbqlPromptIncludesOutputContract(t *testing.T) {
 	}
 }
 
-func TestBuildAgentTurnRequestSharesPreviewOnlyAfterExplicitOptIn(t *testing.T) {
+func TestBuildAgentTurnRequestSharesBoundedPreviewByDefault(t *testing.T) {
 	querySession := &session.QuerySession{
 		ExecutionResult: session.ExecutionResult{
 			Query:        "SELECT * FROM MEASURE latency IN production TIME > '-30m' LIMIT 10",
@@ -74,13 +74,8 @@ func TestBuildAgentTurnRequestSharesPreviewOnlyAfterExplicitOptIn(t *testing.T) 
 	if payload.ExecutionSummary == nil {
 		t.Fatal("expected execution summary")
 	}
-	if len(payload.ExecutionSummary.Preview) != 0 {
-		t.Fatalf("preview must not be shared by default: %+v", payload.ExecutionSummary.Preview)
-	}
-	querySession.IncludePreview = true
-	payload = BuildAgentTurnRequest(querySession, QueryHints{}, "", "")
 	if len(payload.ExecutionSummary.Preview) != 2 {
-		t.Fatalf("expected opted-in preview to be shared: %+v", payload.ExecutionSummary.Preview)
+		t.Fatalf("expected preview to be shared by default: %+v", payload.ExecutionSummary.Preview)
 	}
 }
 

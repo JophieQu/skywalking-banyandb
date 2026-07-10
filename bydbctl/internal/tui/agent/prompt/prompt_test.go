@@ -30,10 +30,10 @@ func TestBuildInitialPrompt(t *testing.T) {
 	})
 	for _, expected := range []string{
 		"Generate a query",
-		"query_hints",
-		"TIME vs LIMIT",
-		"Use only the four provided bydbctl tools",
-		"validate_bydbql",
+		"propose_query_plan",
+		"at most five catalog candidates",
+		"Use only the five provided bydbctl tools",
+		"typed query plans",
 	} {
 		if !strings.Contains(promptText, expected) {
 			t.Fatalf("prompt does not contain %q:\n%s", expected, promptText)

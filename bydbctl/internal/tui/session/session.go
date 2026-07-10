@@ -80,6 +80,39 @@ type TimeRange struct {
 	End   string
 }
 
+// SchemaColumnKind identifies how a column is represented by a BanyanDB schema.
+type SchemaColumnKind string
+
+// Schema column kinds.
+const (
+	SchemaColumnTag       SchemaColumnKind = "tag"
+	SchemaColumnEntityTag SchemaColumnKind = "entity_tag"
+	SchemaColumnField     SchemaColumnKind = "field"
+)
+
+// SchemaValueType identifies the queryable type of a schema column.
+type SchemaValueType string
+
+// Schema value types.
+const (
+	SchemaValueTypeUnknown     SchemaValueType = "unknown"
+	SchemaValueTypeString      SchemaValueType = "string"
+	SchemaValueTypeInt         SchemaValueType = "int"
+	SchemaValueTypeFloat       SchemaValueType = "float"
+	SchemaValueTypeStringArray SchemaValueType = "string_array"
+	SchemaValueTypeIntArray    SchemaValueType = "int_array"
+	SchemaValueTypeTimestamp   SchemaValueType = "timestamp"
+	SchemaValueTypeBinary      SchemaValueType = "binary"
+)
+
+// SchemaColumn is one typed, queryable column from a resource schema.
+type SchemaColumn struct {
+	Name    string
+	Kind    SchemaColumnKind
+	Type    SchemaValueType
+	Indexed bool
+}
+
 // SchemaSnapshot is the schema summary passed across the agent boundary.
 type SchemaSnapshot struct {
 	UpdatedAt       time.Time
@@ -89,11 +122,34 @@ type SchemaSnapshot struct {
 	Tags            []string
 	EntityTags      []string
 	Fields          []string
+	Columns         []SchemaColumn
 	IndexedFields   []string
 	ResourceNames   []string
 	AvailableGroups []string
 	Catalog         []CatalogEntry
 	Loaded          bool
+}
+
+// Column returns a typed schema column by its case-insensitive name.
+func (snapshot SchemaSnapshot) Column(name string) (SchemaColumn, bool) {
+	trimmedName := strings.TrimSpace(name)
+	for _, column := range snapshot.Columns {
+		if strings.EqualFold(column.Name, trimmedName) {
+			return column, true
+		}
+	}
+	var suffixMatch SchemaColumn
+	matchCount := 0
+	for _, column := range snapshot.Columns {
+		if strings.EqualFold(column.Name[strings.LastIndex(column.Name, ".")+1:], trimmedName) {
+			suffixMatch = column
+			matchCount++
+		}
+	}
+	if matchCount == 1 {
+		return suffixMatch, true
+	}
+	return SchemaColumn{}, false
 }
 
 // CatalogEntry is one discoverable BanyanDB resource in a group.
@@ -127,6 +183,16 @@ type BydbqlCandidate struct {
 	Query       string
 	Explanation string
 	Source      CandidateSource
+}
+
+// PlannedQuery is one independently approved query from an agent workflow plan.
+type PlannedQuery struct {
+	ResourceType ResourceType
+	ID           string
+	Query        string
+	Name         string
+	Groups       []string
+	Completed    bool
 }
 
 // ValidationReport stores local BYDBQL validation output.
@@ -193,11 +259,12 @@ type QuerySession struct {
 	SchemaSnapshot    SchemaSnapshot
 	SlotsPinned       bool
 	AutoMatched       bool
-	IncludePreview    bool
 	AgentSessionID    string
 	Conversation      []ConversationTurn
 	Candidates        []BydbqlCandidate
+	PlannedQueries    []PlannedQuery
 	SelectedCandidate int
+	ActivePlanStep    int
 	Validation        ValidationReport
 	ExecutionResult   ExecutionResult
 	Transcript        []TranscriptEntry
@@ -220,6 +287,31 @@ func (qs *QuerySession) AddCandidate(candidate BydbqlCandidate) {
 	qs.Candidates = append(qs.Candidates, candidate)
 	qs.SelectedCandidate = len(qs.Candidates) - 1
 	qs.Validation = candidate.Validation
+}
+
+// SetPlannedQueries replaces the active agent workflow with compiled, exact statements.
+func (qs *QuerySession) SetPlannedQueries(queries []PlannedQuery) {
+	qs.PlannedQueries = append([]PlannedQuery(nil), queries...)
+	qs.ActivePlanStep = 0
+}
+
+// CurrentPlannedQuery returns the next query that must receive individual approval.
+func (qs *QuerySession) CurrentPlannedQuery() *PlannedQuery {
+	if qs == nil || qs.ActivePlanStep < 0 || qs.ActivePlanStep >= len(qs.PlannedQueries) {
+		return nil
+	}
+	return &qs.PlannedQueries[qs.ActivePlanStep]
+}
+
+// CompletePlannedQuery records execution and advances to the next planned statement.
+func (qs *QuerySession) CompletePlannedQuery(query string) *PlannedQuery {
+	currentQuery := qs.CurrentPlannedQuery()
+	if currentQuery == nil || currentQuery.Query != query {
+		return nil
+	}
+	currentQuery.Completed = true
+	qs.ActivePlanStep++
+	return qs.CurrentPlannedQuery()
 }
 
 // SelectCandidate makes an existing version the current candidate.

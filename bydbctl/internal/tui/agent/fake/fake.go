@@ -71,10 +71,17 @@ func (gateway *Gateway) Send(ctx context.Context, _ string, req agent.TurnReques
 		if req.Payload.ValidationError != nil {
 			explanation = fmt.Sprintf("fake agent kept the candidate after validation feedback: %s", *req.Payload.ValidationError)
 		}
+		if !send(ctx, events, agent.Event{
+			Kind:      agent.EventKindCandidate,
+			Candidate: candidate,
+			Origin:    agent.EventOriginToolBridge,
+			ToolName:  "propose_query_plan",
+		}) {
+			return
+		}
 		_ = send(ctx, events, agent.Event{
 			Kind:        agent.EventKindFinalResponse,
 			Message:     explanation,
-			Candidate:   candidate,
 			Explanation: explanation,
 		})
 	}()

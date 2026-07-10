@@ -161,14 +161,20 @@ func (m Model) renderConversation(width int) string {
 }
 
 func (m Model) renderSlots(width int) string {
-	rows := []string{
-		m.slotRow("Type", activeChipStyle.Render(m.resourceType.String())),
-		m.slotRow("Name", m.resourceName.View()),
-		m.slotRow("Groups", m.groups.View()),
+	rows := []string{titleStyle.Render("Autonomous discovery")}
+	if m.querySession == nil || strings.TrimSpace(m.querySession.ResourceName) == "" {
+		rows = append(rows, mutedStyle.Render("The agent will inspect the catalog and choose a schema."))
+	} else {
+		rows = append(rows,
+			m.slotRow("Selected", activeChipStyle.Render(m.querySession.ResourceType.String()+"/"+m.querySession.ResourceName)),
+			m.slotRow("Groups", strings.Join(m.querySession.Groups, ", ")),
+		)
+	}
+	rows = append(rows,
 		m.slotRow("Start", m.start.View()),
 		m.slotRow("End", m.end.View()),
-	}
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, append([]string{titleStyle.Render("Slots")}, rows...)...))
+	)
+	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
 }
 
 func (m Model) renderWorkflow(width int) string {
@@ -205,10 +211,7 @@ func (m Model) renderCandidateHistory(width int) string {
 		selectedCandidate = m.querySession.SelectedCandidateIndex()
 		diff = candidateDiff(m.querySession)
 	}
-	previewSharing := "off"
-	if m.querySession != nil && m.querySession.IncludePreview {
-		previewSharing = "on (Ctrl+P)"
-	}
+	previewSharing := "automatic (up to 50 rows)"
 	status := badStyle.Render(report.Status())
 	if report.Valid {
 		status = okStyle.Render(report.Status())
@@ -288,8 +291,6 @@ func (m Model) slotRow(label, value string) string {
 	focused := map[int]string{
 		focusCatalogFilter: "Filter",
 		focusTurnHint:      "Turn hint (Ctrl+A)",
-		focusResourceName:  "Name",
-		focusGroups:        "Groups",
 		focusStart:         "Start",
 		focusEnd:           "End",
 	}

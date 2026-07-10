@@ -67,3 +67,25 @@ func TestSemanticValidatorAcceptsKnownProjection(t *testing.T) {
 		t.Fatalf("expected valid report, got %q", report.Message)
 	}
 }
+
+func TestSemanticValidatorAcceptsUnambiguousTagFamilySuffix(t *testing.T) {
+	validator := NewSemanticValidator()
+	report, validateErr := validator.Validate(context.Background(),
+		"SELECT endpoint FROM MEASURE service_latency IN production TIME > '-30m' LIMIT 10",
+		&session.SchemaSnapshot{
+			Type: session.ResourceTypeMeasure,
+			Tags: []string{"default.endpoint"},
+			Columns: []session.SchemaColumn{{
+				Name: "default.endpoint",
+				Kind: session.SchemaColumnTag,
+				Type: session.SchemaValueTypeString,
+			}},
+		},
+	)
+	if validateErr != nil {
+		t.Fatalf("Validate returned error: %v", validateErr)
+	}
+	if !report.Valid {
+		t.Fatalf("expected tag family suffix to be accepted: %+v", report)
+	}
+}

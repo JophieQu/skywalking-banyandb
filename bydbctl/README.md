@@ -4,8 +4,9 @@
 
 ## BYDBQL Agent TUI
 
-`bydbctl agent` uses an ACP agent to draft and revise BYDBQL in a three-page terminal workspace. bydbctl owns the controlled tool bridge and requires
-one-time approval before every query execution. See the [BYDBQL Agent TUI guide](../docs/interacting/bydbctl/agent.md).
+`bydbctl agent` uses any compatible ACP provider to discover schemas and submit typed query plans in a three-page terminal workspace. bydbctl owns the
+controlled tool bridge, deterministically renders BYDBQL, and requires one-time approval before every query execution. See the
+[BYDBQL Agent TUI guide](../docs/interacting/bydbctl/agent.md).
 
 ## Build
 

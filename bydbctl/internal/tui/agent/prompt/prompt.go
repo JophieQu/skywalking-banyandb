@@ -22,18 +22,11 @@ package prompt
 import (
 	"bytes"
 	_ "embed"
-	"fmt"
 	"strings"
 )
 
-//go:embed references/safety.md
-var safetyReference string
-
 //go:embed references/syntax.md
 var syntaxReference string
-
-//go:embed references/examples.md
-var examplesReference string
 
 // Input carries rendered prompt inputs for BYDBQL generation.
 type Input struct {
@@ -53,7 +46,7 @@ func Build(input Input) string {
 func buildInitial(input Input) string {
 	taskPrompt := strings.TrimSpace(input.TaskPrompt)
 	if taskPrompt == "" {
-		taskPrompt = "Generate one BYDBQL query from the goal, slots, and schema in the context JSON."
+		taskPrompt = "Discover the relevant BanyanDB schema and submit one structured query plan from the context JSON."
 	}
 	var promptBuffer bytes.Buffer
 	writeRole(&promptBuffer)
@@ -72,7 +65,7 @@ func buildInitial(input Input) string {
 func buildRevise(input Input) string {
 	taskPrompt := strings.TrimSpace(input.TaskPrompt)
 	if taskPrompt == "" {
-		taskPrompt = "Revise the BYDBQL candidate using validation or execution feedback in the context JSON."
+		taskPrompt = "Revise the structured query plan using validation or execution feedback in the context JSON."
 	}
 	var promptBuffer bytes.Buffer
 	writeRole(&promptBuffer)
@@ -89,58 +82,53 @@ func buildRevise(input Input) string {
 }
 
 func writeRole(prompt *bytes.Buffer) {
-	prompt.WriteString("You are a BanyanDB BYDBQL generation specialist.\n")
-	prompt.WriteString("Your only job is to return one syntactically valid BYDBQL candidate for the bydbctl editor.\n\n")
+	prompt.WriteString("You are a BanyanDB query-planning specialist.\n")
+	prompt.WriteString("Discover schemas and submit typed query plans; bydbctl, not you, renders the final BYDBQL.\n\n")
 }
 
 func writeHardRules(prompt *bytes.Buffer, initial bool) {
 	prompt.WriteString("Hard rules:\n")
-	prompt.WriteString("- Use validate_bydbql with the complete candidate before presenting it to the user. This is the only way to publish a candidate.\n")
-	prompt.WriteString("- Do not rely on Markdown, JSON, or prose to communicate a candidate; bydbctl ignores candidates embedded in text.\n")
-	prompt.WriteString("- The statement must start with SELECT or SHOW TOP.\n")
-	prompt.WriteString("- Do not include a trailing semicolon.\n")
-	prompt.WriteString("- Use only the schema summary, slots, query_hints, and template_hint from the context JSON.\n")
-	prompt.WriteString("- Use only the four provided bydbctl tools. Do not use shell commands, external MCP servers, downloads, or runtime tool registration.\n")
-	prompt.WriteString("- You may use schema and validation tools without asking. Call execute_bydbql only after the user explicitly asks to run the exact statement; ")
+	prompt.WriteString("- Never write, validate, or publish a raw BYDBQL statement. Publish candidates only through propose_query_plan.\n")
+	prompt.WriteString("- On a new goal, call list_groups_schemas, rank at most five catalog candidates, and call describe_schema for at most three.\n")
+	prompt.WriteString("- Use only the typed columns returned by describe_schema. Do not invent a resource, group, field, tag, type, or index.\n")
+	prompt.WriteString("- Use only the five provided bydbctl tools. Do not use shell commands, external MCP servers, downloads, or runtime tool registration.\n")
+	prompt.WriteString("- propose_query_plan accepts a plan or workflow. Its result is the only structured candidate that bydbctl will show.\n")
+	prompt.WriteString("- You may use schema and plan tools without asking. Call execute_bydbql only after the user explicitly asks to run the exact statement; ")
 	prompt.WriteString("it always requires a fresh TUI approval.\n")
-	prompt.WriteString("- Keep the query read-only. Never generate create, update, delete, drop, or apply operations.\n")
-	prompt.WriteString("- When query_hints.slots_pinned=true, use schema.type, schema.name, and schema.groups exactly.\n")
-	prompt.WriteString("- When query_hints.slots_pinned=false and schema.catalog is present, choose the best matching catalog entry for the goal.\n")
-	prompt.WriteString("- For MEASURE, STREAM, TRACE, and SHOW TOP, include a TIME clause from time_range in the context.\n")
+	prompt.WriteString("- Keep every plan read-only. Never generate create, update, delete, drop, or apply operations.\n")
+	prompt.WriteString("- The deterministic planner supports projections, typed comparison/IN filters, AND/OR trees, indexed ordering, ")
+	prompt.WriteString("measure aggregation/grouping, and SHOW TOP.\n")
+	prompt.WriteString("- Supported aggregation functions are MEAN, COUNT, MAX, MIN, and SUM. ORDER BY may use TIME or a typed indexed column.\n")
+	prompt.WriteString("- Do not request MATCH, HAVING, OFFSET, STAGES, WITH QUERY_TRACE, joins, or unsupported expressions. Ask one clarification instead.\n")
 	prompt.WriteString("- turn_hint is the user's instruction for the current round; apply it on top of goal and prior conversation.\n")
 	if initial {
-		prompt.WriteString("- For exploratory SELECT queries, include LIMIT 10 unless query_hints specify otherwise.\n")
+		prompt.WriteString("- Omitted time and row-count constraints are rendered by bydbctl as the safe defaults: last 30 minutes and LIMIT 10.\n")
 	} else {
-		prompt.WriteString("- Fix validation_error or execution_summary.error when present; preserve correct parts of the candidate.\n")
-		prompt.WriteString("- After validate_bydbql succeeds, give a short user-facing summary. Do not repeat the query in Markdown or JSON.\n")
+		prompt.WriteString("- Fix validation_error or execution_summary.error when present; preserve correct parts of the prior plan.\n")
+		prompt.WriteString("- Execution previews contain at most 50 rows and may be used to plan the next independently approved step.\n")
 	}
-	prompt.WriteString("- ORDER BY may only use fields listed in schema.indexed_fields; omit ORDER BY when no indexed field matches.\n\n")
+	prompt.WriteString("- When a catalog choice remains ambiguous after inspection, ask exactly one concise clarification question instead of guessing.\n\n")
 }
 
 func writeNLRules(prompt *bytes.Buffer) {
 	prompt.WriteString("Natural language rules:\n")
-	prompt.WriteString("- When slots_pinned=true, schema slots override names inferred from the goal.\n")
-	prompt.WriteString("- When slots_pinned=false, prefer schema.catalog and schema.available_groups to infer type, name, and group.\n")
-	prompt.WriteString("- query_hints.prefer_show_top=true means use SHOW TOP, not SELECT with LIMIT.\n")
-	prompt.WriteString("- Distinguish time ranges (TIME clause) from data-point limits (LIMIT clause).\n")
-	prompt.WriteString("- template_hint shows a valid baseline query for the current slots; adapt it to the goal.\n")
-	prompt.WriteString("- schema.available_resources lists resource names in the current group when the name slot may be wrong.\n")
-	prompt.WriteString("- schema.catalog lists discoverable resources across groups when the user only provided a goal.\n")
-	prompt.WriteString("- conversation lists prior user hints and agent candidates; continue from the latest state.\n\n")
+	prompt.WriteString("- schema.catalog is a discovery hint, not a user selection. Select a resource only after inspecting its actual typed schema.\n")
+	prompt.WriteString("- query_hints.prefer_show_top means use a SHOW TOP plan, not SELECT with LIMIT.\n")
+	prompt.WriteString("- Distinguish time ranges from data-point limits; use the user wording when it is explicit.\n")
+	prompt.WriteString("- A goal spanning multiple resources requires a workflow with one independently approved plan step per resource.\n")
+	prompt.WriteString("- conversation lists prior user hints and compiled candidates; continue from the latest state.\n\n")
 }
 
 func writeReferences(prompt *bytes.Buffer) {
-	prompt.WriteString("Reference:\n")
-	prompt.WriteString(strings.TrimSpace(safetyReference))
-	prompt.WriteString("\n\n")
+	prompt.WriteString("Compiler vocabulary reference (understand it, but submit a plan rather than BYDBQL text):\n")
 	prompt.WriteString(strings.TrimSpace(syntaxReference))
-	prompt.WriteString("\n\n")
-	prompt.WriteString(strings.TrimSpace(examplesReference))
 	prompt.WriteString("\n\n")
 }
 
 func writeOutputContract(prompt *bytes.Buffer) {
 	prompt.WriteString("Output contract:\n")
-	prompt.WriteString("- Explain your plan and result briefly in user-facing language.\n")
-	prompt.WriteString(fmt.Sprintf("- Publish the complete candidate through %s; do not embed it in free text.\n\n", "validate_bydbql"))
+	prompt.WriteString("- Explain the selected schema and result briefly in user-facing language.\n")
+	prompt.WriteString("- A plan has resource(type, name, groups), optional projection/filter/group_by/order_by/time_range/limit, and optional aggregate or top_n.\n")
+	prompt.WriteString("- A workflow has ordered steps, each with the same plan structure; do not emit a fabricated cross-resource join.\n")
+	prompt.WriteString("- Submit the complete structured plan through propose_query_plan; do not embed BYDBQL in free text.\n\n")
 }

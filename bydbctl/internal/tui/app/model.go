@@ -48,8 +48,6 @@ const (
 	focusCatalogFilter
 	focusGoal
 	focusTurnHint
-	focusResourceName
-	focusGroups
 	focusStart
 	focusEnd
 	focusQuery
@@ -59,22 +57,16 @@ const (
 
 // Config configures the TUI model.
 type Config struct {
-	AgentGateway   agent.Gateway
-	Executor       tools.Executor
-	Approvals      *approval.Controller
-	ToolBridge     *bridge.ToolBridge
-	SessionLog     *applog.Logger
-	LogDir         string
-	Provider       string
-	Goal           string
-	ResourceType   string
-	ResourceName   string
-	Groups         string
-	Start          string
-	End            string
-	NameProvided   bool
-	GroupsProvided bool
-	TypeProvided   bool
+	AgentGateway agent.Gateway
+	Executor     tools.Executor
+	Approvals    *approval.Controller
+	ToolBridge   *bridge.ToolBridge
+	SessionLog   *applog.Logger
+	LogDir       string
+	Provider     string
+	Goal         string
+	Start        string
+	End          string
 }
 
 // Model is the Bubble Tea state for the bydbctl agent TUI.
@@ -88,11 +80,8 @@ type Model struct {
 	goal            textarea.Model
 	turnHint        textarea.Model
 	query           textarea.Model
-	resourceName    textinput.Model
-	groups          textinput.Model
 	start           textinput.Model
 	end             textinput.Model
-	resourceType    session.ResourceType
 	provider        string
 	status          string
 	events          []string
@@ -108,9 +97,6 @@ type Model struct {
 	detailScroll    int
 	focus           int
 	busy            bool
-	typePinned      bool
-	namePinned      bool
-	groupsPinned    bool
 	pendingApproval *approval.Request
 	turnCancel      context.CancelFunc
 	turnEvents      []agent.Event
@@ -140,8 +126,6 @@ func NewModel(config Config) Model {
 	query.Placeholder = "BYDBQL candidate"
 	query.ShowLineNumbers = false
 	query.SetHeight(10)
-	resourceName := newTextInput(config.ResourceName, "resource name")
-	groups := newTextInput(config.Groups, "group, or group1,group2")
 	start := newTextInput(config.Start, "time start, for example -30m")
 	end := newTextInput(config.End, "optional time end")
 	sessionLog := config.SessionLog
@@ -164,20 +148,14 @@ func NewModel(config Config) Model {
 		goal:           goal,
 		turnHint:       turnHint,
 		query:          query,
-		resourceName:   resourceName,
-		groups:         groups,
 		start:          start,
 		end:            end,
-		resourceType:   session.NormalizeResourceType(config.ResourceType),
 		provider:       provider,
 		status:         "ready",
 		sessionLog:     sessionLog,
 		logPathDisplay: applog.DisplayPath(sessionLogPath(sessionLog)),
 		width:          defaultWidth,
 		height:         defaultHeight,
-		typePinned:     config.TypeProvided,
-		namePinned:     config.NameProvided,
-		groupsPinned:   config.GroupsProvided,
 		activeTab:      tabQuery,
 	}
 	if sessionLog != nil {
@@ -426,11 +404,6 @@ func (m *Model) syncQuerySession() {
 	if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil {
 		m.query.SetValue(currentCandidate.Query)
 	}
-	if m.querySession.AutoMatched {
-		m.resourceName.SetValue(m.querySession.ResourceName)
-		m.groups.SetValue(strings.Join(m.querySession.Groups, ","))
-		m.resourceType = m.querySession.ResourceType
-	}
 	if strings.TrimSpace(m.querySession.SchemaSnapshot.Name) != "" {
 		m.selectedSchema = m.querySession.SchemaSnapshot
 	}
@@ -504,10 +477,6 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 	case "shift+tab":
 		m.cycleFocus(-1)
 		return m.syncFocus(), true
-	case "ctrl+r":
-		m.resourceType = nextResourceType(m.resourceType)
-		m.typePinned = true
-		return nil, true
 	case "ctrl+l":
 		if m.busy {
 			return nil, true
@@ -583,7 +552,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		return nil, false
 	case "enter":
 		if m.focus == focusCatalog {
-			return m.selectCatalogEntry(), true
+			return m.loadSchemaDetailCmdForCursor(), true
 		}
 		return nil, false
 	case "ctrl+a":
@@ -620,16 +589,7 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		m.turnCancel = cancelExecute
 		return m.executeCmd(executeCtx), true
 	case "ctrl+p":
-		if m.querySession == nil || len(m.querySession.ExecutionResult.Preview) == 0 {
-			m.addUIEvent("execute a query before sharing a preview with the agent")
-			return nil, true
-		}
-		m.querySession.IncludePreview = !m.querySession.IncludePreview
-		if m.querySession.IncludePreview {
-			m.status = "current preview will be shared with the next agent turn"
-		} else {
-			m.status = "current preview will not be shared with the agent"
-		}
+		m.status = "the next agent turn automatically receives up to 50 preview rows"
 		return nil, true
 	default:
 		return nil, false
@@ -676,8 +636,6 @@ func (m *Model) syncFocus() tea.Cmd {
 	m.goal.Blur()
 	m.turnHint.Blur()
 	m.catalogFilter.Blur()
-	m.resourceName.Blur()
-	m.groups.Blur()
 	m.start.Blur()
 	m.end.Blur()
 	m.query.Blur()
@@ -690,10 +648,6 @@ func (m *Model) syncFocus() tea.Cmd {
 		return m.goal.Focus()
 	case focusTurnHint:
 		return m.turnHint.Focus()
-	case focusResourceName:
-		return m.resourceName.Focus()
-	case focusGroups:
-		return m.groups.Focus()
 	case focusStart:
 		return m.start.Focus()
 	case focusEnd:
@@ -725,10 +679,6 @@ func (m *Model) updateFocused(teaMsg tea.Msg) tea.Cmd {
 		m.goal, updateCmd = m.goal.Update(teaMsg)
 	case focusTurnHint:
 		m.turnHint, updateCmd = m.turnHint.Update(teaMsg)
-	case focusResourceName:
-		m.resourceName, updateCmd = m.resourceName.Update(teaMsg)
-	case focusGroups:
-		m.groups, updateCmd = m.groups.Update(teaMsg)
 	case focusStart:
 		m.start, updateCmd = m.start.Update(teaMsg)
 	case focusEnd:
@@ -759,8 +709,6 @@ func (m *Model) resize(width, height int) {
 	m.goal.SetWidth(maxInt(18, middleWidth-4))
 	m.turnHint.SetWidth(maxInt(18, middleWidth-4))
 	m.query.SetWidth(maxInt(18, queryWidth-4))
-	m.resourceName.Width = inputWidth
-	m.groups.Width = inputWidth
 	m.start.Width = inputWidth
 	m.end.Width = inputWidth
 	queryHeight := clamp(height-18, 10, 22)
@@ -837,17 +785,11 @@ func (m Model) executeCmd(ctx context.Context) tea.Cmd {
 
 func (m Model) startOptions() workflow.StartOptions {
 	return workflow.StartOptions{
-		ResourceType: m.resourceType,
 		TimeRange: session.TimeRange{
 			Start: m.start.Value(),
 			End:   m.end.Value(),
 		},
-		Goal:           m.goal.Value(),
-		ResourceName:   m.resourceName.Value(),
-		Groups:         []string{m.groups.Value()},
-		NameProvided:   m.namePinned || strings.TrimSpace(m.resourceName.Value()) != "",
-		GroupsProvided: m.groupsPinned || strings.TrimSpace(m.groups.Value()) != "",
-		TypeProvided:   m.typePinned,
+		Goal: m.goal.Value(),
 	}
 }
 
@@ -863,27 +805,6 @@ func (m Model) loadCatalogCmd() tea.Cmd {
 		}
 		return catalogMsg{catalog: catalog}
 	}
-}
-
-func (m *Model) selectCatalogEntry() tea.Cmd {
-	entry, ok := m.catalog.selectedEntry()
-	if !ok {
-		return nil
-	}
-	m.applyCatalogEntry(entry)
-	m.detailScroll = 0
-	m.addUIEvent(fmt.Sprintf("selected %s %s in %s", entry.Type, entry.Name, entry.Group))
-	m.logWrite("catalog", fmt.Sprintf("selected %s/%s group=%s", entry.Type, entry.Name, entry.Group))
-	return m.loadSchemaDetailCmd(entry)
-}
-
-func (m *Model) applyCatalogEntry(entry session.CatalogEntry) {
-	m.resourceType = entry.Type
-	m.resourceName.SetValue(entry.Name)
-	m.groups.SetValue(entry.Group)
-	m.typePinned = true
-	m.namePinned = true
-	m.groupsPinned = true
 }
 
 func (m Model) loadSchemaDetailCmd(entry session.CatalogEntry) tea.Cmd {
@@ -969,21 +890,6 @@ func ensureSession(
 		}
 	}
 	return updatedSession, nil
-}
-
-func nextResourceType(resourceType session.ResourceType) session.ResourceType {
-	switch resourceType {
-	case session.ResourceTypeMeasure:
-		return session.ResourceTypeStream
-	case session.ResourceTypeStream:
-		return session.ResourceTypeTrace
-	case session.ResourceTypeTrace:
-		return session.ResourceTypeProperty
-	case session.ResourceTypeProperty:
-		return session.ResourceTypeTopN
-	default:
-		return session.ResourceTypeMeasure
-	}
 }
 
 func (m *Model) addAgentEvents(events []agent.Event) {

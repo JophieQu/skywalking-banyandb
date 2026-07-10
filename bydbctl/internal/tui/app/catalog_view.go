@@ -72,7 +72,7 @@ func (m Model) renderCatalogList(width, height int) string {
 		line := renderCatalogRow(row, rowIdx == m.catalog.cursor && m.focus == focusCatalog, width-6)
 		lines = append(lines, line)
 	}
-	lines = append(lines, mutedStyle.Render("↑↓ browse · enter select slot"))
+	lines = append(lines, mutedStyle.Render("↑↓ browse · enter inspect schema"))
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }
 

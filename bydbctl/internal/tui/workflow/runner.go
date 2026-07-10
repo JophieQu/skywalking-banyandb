@@ -172,6 +172,9 @@ func (runner *Runner) StartSession(ctx context.Context, options StartOptions) (*
 	if catalogErr != nil {
 		return nil, fmt.Errorf("failed to discover schema catalog: %w", catalogErr)
 	}
+	if usesAutonomousDiscovery(options) {
+		return newAutonomousSession(options, catalog, runner.now()), nil
+	}
 	resolved := ResolveSessionSlots(options, catalog)
 	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
 		Type:   resolved.ResourceType,
@@ -218,6 +221,16 @@ func (runner *Runner) SyncSession(ctx context.Context, querySession *session.Que
 	if catalogErr != nil {
 		return nil, fmt.Errorf("failed to discover schema catalog: %w", catalogErr)
 	}
+	if usesAutonomousDiscovery(options) {
+		querySession.UserGoal = strings.TrimSpace(options.Goal)
+		querySession.TimeRange = applyTimeDefaults(options.TimeRange)
+		querySession.SchemaSnapshot.AvailableGroups = append([]string(nil), catalog.Groups...)
+		querySession.SchemaSnapshot.Catalog = append([]session.CatalogEntry(nil), catalog.Entries...)
+		querySession.SlotsPinned = false
+		querySession.AutoMatched = false
+		querySession.AddTranscript("workflow", "refreshed catalog for autonomous schema discovery", runner.now())
+		return querySession, nil
+	}
 	resolved := ResolveSessionSlots(options, catalog)
 	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
 		Type:   resolved.ResourceType,
@@ -246,6 +259,33 @@ func (runner *Runner) SyncSession(ctx context.Context, querySession *session.Que
 		)
 	}
 	return querySession, nil
+}
+
+func newAutonomousSession(options StartOptions, catalog session.SchemaCatalog, now time.Time) *session.QuerySession {
+	querySession := &session.QuerySession{
+		ID:          uuid.NewString(),
+		Phase:       session.PhaseIntent,
+		UserGoal:    strings.TrimSpace(options.Goal),
+		TimeRange:   applyTimeDefaults(options.TimeRange),
+		AutoMatched: false,
+		SchemaSnapshot: session.SchemaSnapshot{
+			UpdatedAt:       catalog.UpdatedAt,
+			AvailableGroups: append([]string(nil), catalog.Groups...),
+			Catalog:         append([]session.CatalogEntry(nil), catalog.Entries...),
+		},
+	}
+	querySession.AddTranscript("workflow", "created autonomous BYDBQL agent session", now)
+	return querySession
+}
+
+func usesAutonomousDiscovery(options StartOptions) bool {
+	if options.NameProvided || options.GroupsProvided || options.TypeProvided {
+		return false
+	}
+	if strings.TrimSpace(options.ResourceName) != "" {
+		return false
+	}
+	return len(normalizeGroupsIfProvided(options.Groups)) == 0
 }
 
 func slotsChanged(querySession *session.QuerySession, options StartOptions) bool {
@@ -333,12 +373,15 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 	if trimmedTurnHint != "" {
 		querySession.AddTranscript("user", trimmedTurnHint, runner.now())
 	}
-	templateHint := BuildTemplateQuery(
-		querySession.ResourceType,
-		querySession.ResourceName,
-		querySession.Groups,
-		querySession.TimeRange,
-	)
+	templateHint := ""
+	if strings.TrimSpace(querySession.ResourceName) != "" {
+		templateHint = BuildTemplateQuery(
+			querySession.ResourceType,
+			querySession.ResourceName,
+			querySession.Groups,
+			querySession.TimeRange,
+		)
+	}
 	hints := ClassifyIntent(querySession)
 	payload := agent.BuildAgentTurnRequest(querySession, hints, templateHint, trimmedTurnHint)
 	agentEvents, sendErr := runner.sendAgentTurn(ctx, agentSessionID, payload)
@@ -387,6 +430,7 @@ func (runner *Runner) streamAgentTurn(
 		case event, open := <-agentEvents:
 			if !open {
 				agentEvents = nil
+				collectedEvents = drainBridgeEvents(toolEvents, querySession, updates, collectedEvents)
 				continue
 			}
 			collectedEvents = append(collectedEvents, event)
@@ -409,6 +453,26 @@ func (runner *Runner) streamAgentTurn(
 	updates <- TurnUpdate{Done: true, Err: completeErr, QuerySession: querySession}
 }
 
+func drainBridgeEvents(
+	toolEvents <-chan agent.Event,
+	querySession *session.QuerySession,
+	updates chan<- TurnUpdate,
+	collectedEvents []agent.Event,
+) []agent.Event {
+	if toolEvents == nil {
+		return collectedEvents
+	}
+	for {
+		select {
+		case event := <-toolEvents:
+			collectedEvents = append(collectedEvents, event)
+			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+		default:
+			return collectedEvents
+		}
+	}
+}
+
 func bridgeEvents(toolBridge *bridge.ToolBridge) <-chan agent.Event {
 	if toolBridge == nil {
 		return nil
@@ -417,7 +481,7 @@ func bridgeEvents(toolBridge *bridge.ToolBridge) <-chan agent.Event {
 }
 
 func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string, turnEvents []agent.Event) error {
-	candidate := RepairFragmentedQuery(finalCandidate(turnEvents))
+	candidate := finalCandidate(turnEvents)
 	if strings.TrimSpace(candidate) == "" {
 		querySession.Phase = session.PhaseValidate
 		outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
@@ -496,6 +560,11 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 		return errors.New("only a valid BYDBQL candidate can be executed")
 	}
 	query := currentCandidate.Query
+	plannedQuery := querySession.CurrentPlannedQuery()
+	if plannedQuery != nil && plannedQuery.Query != query {
+		querySession.Phase = session.PhaseValidate
+		return errors.New("only the current compiled workflow statement can be executed")
+	}
 	decision, approvalErr := runner.approvals.Request(ctx, runner.executionApproval(querySession, query, approval.SourceManual))
 	if approvalErr != nil {
 		querySession.Phase = session.PhaseReady
@@ -528,12 +597,68 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 		return fmt.Errorf("failed to execute query: %w", executeErr)
 	}
 	querySession.ExecutionResult = executionResult
-	querySession.Phase = session.PhaseExecuted
 	if executionResult.Hint != "" {
 		querySession.AddTranscript("workflow", executionResult.Hint, runner.now())
 	}
 	querySession.AddTranscript("workflow", executionResult.Summary, runner.now())
+	if plannedQuery != nil {
+		nextPlanStep := querySession.CompletePlannedQuery(query)
+		if nextPlanStep != nil {
+			return runner.prepareNextPlanStep(ctx, querySession, *nextPlanStep)
+		}
+	}
+	querySession.Phase = session.PhaseExecuted
 	return nil
+}
+
+func (runner *Runner) prepareNextPlanStep(
+	ctx context.Context,
+	querySession *session.QuerySession,
+	nextPlanStep session.PlannedQuery,
+) error {
+	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
+		Type:   nextPlanStep.ResourceType,
+		Name:   nextPlanStep.Name,
+		Groups: nextPlanStep.Groups,
+	})
+	if schemaErr != nil {
+		querySession.Phase = session.PhaseError
+		return fmt.Errorf("failed to refresh next workflow schema: %w", schemaErr)
+	}
+	preserveDiscoveryContext(&schemaSnapshot, querySession.SchemaSnapshot)
+	querySession.ResourceType = schemaSnapshot.Type
+	querySession.ResourceName = schemaSnapshot.Name
+	querySession.Groups = append([]string(nil), schemaSnapshot.Groups...)
+	querySession.SchemaSnapshot = schemaSnapshot
+	validation, validationErr := runner.validator.Validate(ctx, nextPlanStep.Query, &querySession.SchemaSnapshot)
+	if validationErr != nil {
+		querySession.Phase = session.PhaseError
+		return fmt.Errorf("failed to validate next workflow statement: %w", validationErr)
+	}
+	querySession.AddCandidate(session.BydbqlCandidate{
+		ID:          fmt.Sprintf("candidate-%d", len(querySession.Candidates)+1),
+		Query:       nextPlanStep.Query,
+		Explanation: "next independently approved workflow statement",
+		Source:      session.CandidateSourceAgent,
+		CreatedAt:   runner.now(),
+		Validation:  validation,
+	})
+	querySession.AddTranscript("workflow", "next workflow statement is ready for individual approval", runner.now())
+	if !validation.Valid {
+		querySession.Phase = session.PhaseValidate
+		return fmt.Errorf("next workflow statement failed validation: %s", validation.Message)
+	}
+	querySession.Phase = session.PhaseReady
+	return nil
+}
+
+func preserveDiscoveryContext(target *session.SchemaSnapshot, existing session.SchemaSnapshot) {
+	if len(target.AvailableGroups) == 0 {
+		target.AvailableGroups = append([]string(nil), existing.AvailableGroups...)
+	}
+	if len(target.Catalog) == 0 {
+		target.Catalog = append([]session.CatalogEntry(nil), existing.Catalog...)
+	}
 }
 
 func (runner *Runner) executionApproval(querySession *session.QuerySession, query string, source approval.Source) approval.Request {
@@ -561,9 +686,9 @@ func BuildTemplateQuery(resourceType session.ResourceType, resourceName string, 
 }
 
 func (runner *Runner) sendAgentTurn(ctx context.Context, agentSessionID string, payload agent.RequestPayload) (<-chan agent.Event, error) {
-	taskPrompt := "Generate one BYDBQL query from the goal, slots, and schema in the context JSON."
+	taskPrompt := "Discover the relevant schema and submit a typed query plan from the goal and context JSON."
 	if strings.TrimSpace(payload.Candidate) != "" {
-		taskPrompt = "Revise the BYDBQL candidate using validation or execution feedback in the context JSON."
+		taskPrompt = "Revise the typed query plan using validation or execution feedback in the context JSON."
 	}
 	events, sendErr := runner.agentGateway.Send(ctx, agentSessionID, agent.TurnRequest{
 		Task:    payload.Task,
@@ -623,7 +748,11 @@ func buildTimeClause(timeRange session.TimeRange) string {
 
 func finalCandidate(events []agent.Event) string {
 	for eventIdx := len(events) - 1; eventIdx >= 0; eventIdx-- {
-		if candidate := cleanBydbqlCandidate(events[eventIdx].Candidate); candidate != "" {
+		event := events[eventIdx]
+		if event.Kind != agent.EventKindCandidate || event.Origin != agent.EventOriginToolBridge || event.ToolName != bridge.ToolProposeQueryPlan {
+			continue
+		}
+		if candidate := cleanBydbqlCandidate(event.Candidate); candidate != "" {
 			return candidate
 		}
 	}
