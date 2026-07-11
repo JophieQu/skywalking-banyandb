@@ -92,6 +92,7 @@ func (socketServer *SocketServer) MCPServerConfig(executable string) []any {
 		"name":    "bydbctl-controlled-tools",
 		"command": executable,
 		"args":    []string{"agent-tool-bridge", "--socket", socketServer.Path()},
+		"env":     []any{},
 	}}
 }
 
@@ -229,18 +230,8 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        ToolProposeQueryPlan,
-			"description": "Submit a typed, structured query plan for deterministic local BYDBQL compilation.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"oneOf": []map[string]any{
-					{"required": []string{"plan"}},
-					{"required": []string{"workflow"}},
-				},
-				"properties": map[string]any{
-					"plan":     map[string]string{"type": "object"},
-					"workflow": map[string]string{"type": "object"},
-				},
-			},
+			"description": "Submit a typed, structured query plan for deterministic local BYDBQL compilation. Use resource.type TOPN with top_n for SHOW TOP goals; use MEASURE/STREAM/TRACE/PROPERTY for SELECT goals.",
+			"inputSchema": proposeQueryPlanInputSchema(),
 		},
 		{
 			"name":        ToolValidateBydbQL,

@@ -112,26 +112,53 @@ func TestPermissionDecisionAllowsOnlyControlledTools(t *testing.T) {
 		}
 	}
 	decision := permissionDecision(map[string]any{
+		"toolCall": map[string]any{
+			"title": "mcp__bydbctl-controlled-tools__list_groups_schemas",
+		},
+		"options": []any{
+			map[string]any{"optionId": "allow-once", "kind": "allow_once"},
+			map[string]any{"optionId": "reject-once", "kind": "reject_once"},
+		},
+	})
+	outcome := mapValue(decision, "outcome")
+	if stringValue(outcome, "optionId") != "allow-once" {
+		t.Fatalf("expected MCP-prefixed controlled tool permission to be approved: %+v", decision)
+	}
+	externalDecision := permissionDecision(map[string]any{
 		"toolCall": map[string]any{"name": "shell"},
 		"options": []any{
 			map[string]any{"optionId": "allow", "kind": "allow_once"},
 			map[string]any{"optionId": "reject", "kind": "reject_once"},
 		},
 	})
-	outcome := mapValue(decision, "outcome")
-	if stringValue(outcome, "optionId") != "reject" {
-		t.Fatalf("expected external tool permission to be rejected: %+v", decision)
+	externalOutcome := mapValue(externalDecision, "outcome")
+	if stringValue(externalOutcome, "optionId") != "reject" {
+		t.Fatalf("expected external tool permission to be rejected: %+v", externalDecision)
 	}
-	decision = permissionDecision(map[string]any{
+	lookalikeDecision := permissionDecision(map[string]any{
 		"toolCall": map[string]any{"name": "evil_validate_bydbql"},
 		"options": []any{
 			map[string]any{"optionId": "allow", "kind": "allow_once"},
 			map[string]any{"optionId": "reject", "kind": "reject_once"},
 		},
 	})
-	outcome = mapValue(decision, "outcome")
-	if stringValue(outcome, "optionId") != "reject" {
-		t.Fatalf("expected lookalike tool permission to be rejected: %+v", decision)
+	lookalikeOutcome := mapValue(lookalikeDecision, "outcome")
+	if stringValue(lookalikeOutcome, "optionId") != "reject" {
+		t.Fatalf("expected lookalike tool permission to be rejected: %+v", lookalikeDecision)
+	}
+}
+
+func TestNormalizeEventSkipsACPToolCallUpdates(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","status":"in_progress","title":"list_groups_schemas"}}}`)
+	event := NormalizeEvent(line)
+	if event.Kind != "" {
+		t.Fatalf("expected ACP tool call update to be ignored, got %+v", event)
+	}
+}
+
+func TestNormalizeControlledToolName(t *testing.T) {
+	if got := normalizeControlledToolName("mcp__bydbctl-controlled-tools__propose_query_plan"); got != "propose_query_plan" {
+		t.Fatalf("unexpected normalized tool name: %q", got)
 	}
 }
 

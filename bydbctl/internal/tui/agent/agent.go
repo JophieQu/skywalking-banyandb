@@ -89,6 +89,7 @@ type RequestPayload struct {
 	TurnHint         string                    `json:"turn_hint,omitempty"`
 	Candidate        string                    `json:"candidate"`
 	TemplateHint     string                    `json:"template_hint,omitempty"`
+	PlanExample      map[string]any            `json:"plan_example,omitempty"`
 }
 
 // Constraints are hard safety constraints owned by bydbctl.
@@ -110,6 +111,8 @@ type SchemaSummary struct {
 	AvailableResources []string              `json:"available_resources,omitempty"`
 	AvailableGroups    []string              `json:"available_groups,omitempty"`
 	Catalog            []CatalogEntrySummary `json:"catalog,omitempty"`
+	CatalogTotal       int                   `json:"catalog_total,omitempty"`
+	RankedCandidates   []CatalogEntrySummary `json:"ranked_candidates,omitempty"`
 	Type               string                `json:"type"`
 	Name               string                `json:"name"`
 }
@@ -386,4 +389,9 @@ func catalogSummary(entries []session.CatalogEntry) []CatalogEntrySummary {
 		})
 	}
 	return summary
+}
+
+// CatalogEntrySummaries converts catalog entries into provider-safe summaries.
+func CatalogEntrySummaries(entries []session.CatalogEntry) []CatalogEntrySummary {
+	return catalogSummary(entries)
 }

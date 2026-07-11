@@ -603,10 +603,8 @@ func normalizeSessionUpdate(params map[string]any) agent.Event {
 			Message: fallbackMessage(contentText(mapValue(update, "content")), stringValue(update, "message", "text")),
 		}
 	case "tool_call", "tool_call_update":
-		return agent.Event{
-			Kind:    agent.EventKindToolCall,
-			Message: fallbackMessage(toolMessage(update), updateType),
-		}
+		// Tool lifecycle is reported by the bydbctl tool bridge; ACP progress updates are noisy.
+		return agent.Event{}
 	case "available_commands_update":
 		return agent.Event{
 			Kind:    agent.EventKindPlanUpdate,
@@ -628,21 +626,8 @@ func buildPrompt(req agent.TurnRequest) (string, error) {
 func permissionDecision(params map[string]any) map[string]any {
 	options, _ := params["options"].([]any)
 	if isControlledToolPermission(params) {
-		for _, optionValue := range options {
-			option, optionOK := optionValue.(map[string]any)
-			if !optionOK {
-				continue
-			}
-			optionID := stringValue(option, "optionId", "option_id", "id")
-			optionKind := strings.ToLower(stringValue(option, "kind", "type", "name"))
-			if optionID != "" && (strings.Contains(optionKind, "allow") || strings.Contains(optionKind, "approve")) {
-				return map[string]any{
-					"outcome": map[string]any{
-						"outcome":  "selected",
-						"optionId": optionID,
-					},
-				}
-			}
+		if optionID := firstAllowOption(options); optionID != "" {
+			return selectedPermissionOutcome(optionID)
 		}
 	}
 	for _, optionValue := range options {
@@ -653,14 +638,22 @@ func permissionDecision(params map[string]any) map[string]any {
 		optionID := stringValue(option, "optionId", "option_id", "id")
 		optionKind := strings.ToLower(stringValue(option, "kind", "type", "name"))
 		if optionID != "" && strings.Contains(optionKind, "reject") {
-			return map[string]any{
-				"outcome": map[string]any{
-					"outcome":  "selected",
-					"optionId": optionID,
-				},
-			}
+			return selectedPermissionOutcome(optionID)
 		}
 	}
+	return cancelledPermissionOutcome()
+}
+
+func selectedPermissionOutcome(optionID string) map[string]any {
+	return map[string]any{
+		"outcome": map[string]any{
+			"outcome":  "selected",
+			"optionId": optionID,
+		},
+	}
+}
+
+func cancelledPermissionOutcome() map[string]any {
 	return map[string]any{
 		"outcome": map[string]any{
 			"outcome": "cancelled",
@@ -668,18 +661,74 @@ func permissionDecision(params map[string]any) map[string]any {
 	}
 }
 
+func firstAllowOption(options []any) string {
+	for _, optionValue := range options {
+		option, optionOK := optionValue.(map[string]any)
+		if !optionOK {
+			continue
+		}
+		optionID := stringValue(option, "optionId", "option_id", "id")
+		optionKind := strings.ToLower(stringValue(option, "kind", "type", "name"))
+		if optionID == "" {
+			continue
+		}
+		if strings.Contains(optionKind, "reject") || strings.Contains(optionKind, "deny") {
+			continue
+		}
+		if strings.Contains(optionKind, "allow") || strings.Contains(optionKind, "approve") || strings.Contains(optionID, "allow") {
+			return optionID
+		}
+	}
+	for _, optionValue := range options {
+		option, optionOK := optionValue.(map[string]any)
+		if !optionOK {
+			continue
+		}
+		optionID := stringValue(option, "optionId", "option_id", "id")
+		optionKind := strings.ToLower(stringValue(option, "kind", "type", "name"))
+		if optionID != "" && !strings.Contains(optionKind, "reject") && !strings.Contains(optionKind, "deny") {
+			return optionID
+		}
+	}
+	return ""
+}
+
 func isControlledToolPermission(params map[string]any) bool {
 	toolCall := mapValue(params, "toolCall", "tool_call")
-	toolName := stringValue(toolCall, "name")
-	if toolName == "" {
-		toolName = stringValue(toolCall, "title")
+	candidates := []string{
+		stringValue(toolCall, "name"),
+		stringValue(toolCall, "title"),
 	}
-	switch toolName {
+	for _, candidate := range candidates {
+		if isControlledToolName(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func isControlledToolName(raw string) bool {
+	switch normalizeControlledToolName(raw) {
 	case "list_groups_schemas", "describe_schema", "propose_query_plan", "validate_bydbql", "execute_bydbql":
 		return true
 	default:
 		return false
 	}
+}
+
+func normalizeControlledToolName(raw string) string {
+	trimmedValue := strings.TrimSpace(raw)
+	if trimmedValue == "" {
+		return ""
+	}
+	const mcpPrefix = "mcp__"
+	if strings.HasPrefix(trimmedValue, mcpPrefix) {
+		remainder := strings.TrimPrefix(trimmedValue, mcpPrefix)
+		if separatorIdx := strings.LastIndex(remainder, "__"); separatorIdx >= 0 && separatorIdx < len(remainder)-2 {
+			return strings.TrimSpace(remainder[separatorIdx+2:])
+		}
+	}
+	return trimmedValue
 }
 
 func planMessage(update map[string]any) string {

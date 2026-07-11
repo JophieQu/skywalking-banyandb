@@ -454,6 +454,9 @@ func validateResource(resource Resource, schema session.SchemaSnapshot) error {
 		}
 	}
 	if schema.Type != "" && schema.Type != resource.Type {
+		if resource.Type == session.ResourceTypeTopN && schema.Type == session.ResourceTypeMeasure {
+			return nil
+		}
 		return fmt.Errorf("plan resource type %s does not match discovered schema type %s", resource.Type, schema.Type)
 	}
 	if schema.Name != "" && !strings.EqualFold(schema.Name, resource.Name) {

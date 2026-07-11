@@ -50,6 +50,9 @@ func (m *Model) recordActivity(category, title, detail string) {
 
 func (m *Model) recordAgentActivities(events []agent.Event) {
 	for _, event := range events {
+		if !shouldShowAgentEvent(event) {
+			continue
+		}
 		m.recordActivity(activityCategory(event), activityTitle(event), activityDetail(event))
 	}
 }

@@ -19,6 +19,7 @@ package workflow
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
@@ -194,6 +195,69 @@ func typeKeywordScore(goal string, resourceType session.ResourceType) int {
 		}
 	}
 	return 0
+}
+
+const maxPromptCatalogCandidates = 10
+
+// RankCatalogCandidates returns the highest-scoring catalog entries for a goal.
+func RankCatalogCandidates(goal string, entries []session.CatalogEntry, limit int) []session.CatalogEntry {
+	if limit <= 0 {
+		limit = maxPromptCatalogCandidates
+	}
+	goalTokens := catalogTokens(goal)
+	preferredType := inferResourceType(goal)
+	type rankedEntry struct {
+		entry session.CatalogEntry
+		score int
+	}
+	ranked := make([]rankedEntry, 0, len(entries))
+	for _, entry := range entries {
+		if shouldSkipCatalogEntry(entry) {
+			continue
+		}
+		score := scoreCatalogEntry(goal, goalTokens, entry, preferredType, len(entries))
+		ranked = append(ranked, rankedEntry{entry: entry, score: score})
+	}
+	sort.SliceStable(ranked, func(leftIndex, rightIndex int) bool {
+		if ranked[leftIndex].score != ranked[rightIndex].score {
+			return ranked[leftIndex].score > ranked[rightIndex].score
+		}
+		if ranked[leftIndex].entry.Group != ranked[rightIndex].entry.Group {
+			return ranked[leftIndex].entry.Group < ranked[rightIndex].entry.Group
+		}
+		if ranked[leftIndex].entry.Type != ranked[rightIndex].entry.Type {
+			return ranked[leftIndex].entry.Type < ranked[rightIndex].entry.Type
+		}
+		return ranked[leftIndex].entry.Name < ranked[rightIndex].entry.Name
+	})
+	candidates := make([]session.CatalogEntry, 0, limit)
+	for _, rankedItem := range ranked {
+		if rankedItem.score <= 0 && len(candidates) > 0 {
+			break
+		}
+		candidates = append(candidates, rankedItem.entry)
+		if len(candidates) >= limit {
+			break
+		}
+	}
+	return candidates
+}
+
+// EnsureCatalogEntry includes entry in candidates when missing, keeping the shortest list possible.
+func EnsureCatalogEntry(candidates []session.CatalogEntry, entry session.CatalogEntry, limit int) []session.CatalogEntry {
+	if limit <= 0 {
+		limit = maxPromptCatalogCandidates
+	}
+	for _, candidate := range candidates {
+		if candidate.Type == entry.Type && strings.EqualFold(candidate.Name, entry.Name) && strings.EqualFold(candidate.Group, entry.Group) {
+			return candidates
+		}
+	}
+	updated := append([]session.CatalogEntry{entry}, candidates...)
+	if len(updated) > limit {
+		updated = updated[:limit]
+	}
+	return updated
 }
 
 func shouldSkipCatalogEntry(entry session.CatalogEntry) bool {

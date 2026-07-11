@@ -23,6 +23,21 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 )
 
+func TestRankCatalogCandidatesPaymentEndpoints(t *testing.T) {
+	catalog := []session.CatalogEntry{
+		{Group: "default", Type: session.ResourceTypeMeasure, Name: "service_cpm"},
+		{Group: "sw_metrics", Type: session.ResourceTypeMeasure, Name: "service_endpoint_latency"},
+		{Group: "sw_metrics", Type: session.ResourceTypeMeasure, Name: "service_endpoint_cpm"},
+	}
+	ranked := RankCatalogCandidates("top 10 slow payment endpoints in last 30 minutes", catalog, 3)
+	if len(ranked) == 0 {
+		t.Fatal("expected ranked catalog candidates")
+	}
+	if ranked[0].Name != "service_endpoint_latency" {
+		t.Fatalf("unexpected top candidate: %+v", ranked[0])
+	}
+}
+
 func TestMatchResourceFromGoalEndpointLatency(t *testing.T) {
 	catalog := session.SchemaCatalog{
 		Entries: []session.CatalogEntry{

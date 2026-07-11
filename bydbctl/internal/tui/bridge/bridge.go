@@ -109,9 +109,13 @@ func (toolBridge *ToolBridge) SetSession(querySession *session.QuerySession) {
 	toolBridge.planAttempts = 0
 	toolBridge.schemaDescriptions = 0
 	toolBridge.rankedCandidates = nil
-	if querySession != nil {
-		toolBridge.rankedCandidates = rankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog)
-	}
+	toolBridge.mu.Unlock()
+}
+
+// SetRankedCandidates pins the catalog shortlist used by describe_schema and propose_query_plan.
+func (toolBridge *ToolBridge) SetRankedCandidates(candidates []session.CatalogEntry) {
+	toolBridge.mu.Lock()
+	toolBridge.rankedCandidates = append([]session.CatalogEntry(nil), candidates...)
 	toolBridge.mu.Unlock()
 }
 
@@ -177,8 +181,11 @@ func (toolBridge *ToolBridge) listGroupsSchemas(ctx context.Context) Result {
 	if querySession := toolBridge.session(); querySession != nil {
 		goal = querySession.UserGoal
 	}
-	candidates := rankCatalogCandidates(goal, catalog.Entries)
-	toolBridge.setRankedCandidates(candidates)
+	candidates := toolBridge.rankedCatalogCandidates()
+	if len(candidates) == 0 {
+		candidates = rankCatalogCandidates(goal, catalog.Entries)
+		toolBridge.setRankedCandidates(candidates)
+	}
 	return jsonResult(map[string]any{
 		"groups":          catalog.Groups,
 		"candidate_limit": maxCatalogCandidates,
@@ -248,13 +255,14 @@ func rankCatalogCandidates(goal string, entries []session.CatalogEntry) []sessio
 	goalTokens := strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(goal, "_", " ")), func(r rune) bool {
 		return r < 'a' || r > 'z'
 	})
+	normalizedGoal := strings.ToLower(goal)
 	type rankedEntry struct {
 		entry session.CatalogEntry
 		score int
 	}
 	ranked := make([]rankedEntry, 0, len(entries))
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.Name) == "" {
+		if strings.TrimSpace(entry.Name) == "" || strings.HasPrefix(entry.Group, "_") {
 			continue
 		}
 		name := strings.ToLower(entry.Name)
@@ -268,14 +276,32 @@ func rankCatalogCandidates(goal string, entries []session.CatalogEntry) []sessio
 				score += 2
 			}
 		}
-		if entry.Type == session.ResourceTypeMeasure && (strings.Contains(strings.ToLower(goal), "metric") || strings.Contains(strings.ToLower(goal), "latency")) {
+		if strings.Contains(normalizedGoal, name) {
+			score += 20
+		}
+		if strings.Contains(normalizedGoal, group) {
+			score += 10
+		}
+		if entry.Type == session.ResourceTypeMeasure && (strings.Contains(normalizedGoal, "metric") || strings.Contains(normalizedGoal, "latency") || strings.Contains(normalizedGoal, "endpoint")) {
+			score += 4
+		}
+		if entry.Type == session.ResourceTypeStream && (strings.Contains(normalizedGoal, "log") || strings.Contains(normalizedGoal, "stream")) {
 			score += 2
 		}
-		if entry.Type == session.ResourceTypeStream && (strings.Contains(strings.ToLower(goal), "log") || strings.Contains(strings.ToLower(goal), "stream")) {
+		if entry.Type == session.ResourceTypeTrace && (strings.Contains(normalizedGoal, "trace") || strings.Contains(normalizedGoal, "span")) {
 			score += 2
 		}
-		if entry.Type == session.ResourceTypeTrace && (strings.Contains(strings.ToLower(goal), "trace") || strings.Contains(strings.ToLower(goal), "span")) {
-			score += 2
+		if strings.Contains(group, "metric") && (strings.Contains(normalizedGoal, "metric") || strings.Contains(normalizedGoal, "endpoint") || strings.Contains(normalizedGoal, "latency")) {
+			score += 6
+		}
+		if strings.Contains(name, "latency") && strings.Contains(normalizedGoal, "slow") {
+			score += 8
+		}
+		if strings.Contains(name, "endpoint") && (strings.Contains(normalizedGoal, "endpoint") || strings.Contains(normalizedGoal, "payment")) {
+			score += 8
+		}
+		if group == "default" && len(entries) > 20 {
+			score -= 8
 		}
 		ranked = append(ranked, rankedEntry{entry: entry, score: score})
 	}
@@ -308,7 +334,9 @@ func resourceIsRanked(candidates []session.CatalogEntry, resourceType session.Re
 	for _, group := range groups {
 		found := false
 		for _, entry := range candidates {
-			if entry.Type == resourceType && strings.EqualFold(entry.Name, resourceName) && strings.EqualFold(entry.Group, group) {
+			if catalogTypesCompatible(resourceType, entry.Type) &&
+				strings.EqualFold(entry.Name, resourceName) &&
+				strings.EqualFold(entry.Group, group) {
 				found = true
 				break
 			}
@@ -318,6 +346,13 @@ func resourceIsRanked(candidates []session.CatalogEntry, resourceType session.Re
 		}
 	}
 	return true
+}
+
+func catalogTypesCompatible(planType, catalogType session.ResourceType) bool {
+	if planType == catalogType {
+		return true
+	}
+	return planType == session.ResourceTypeTopN && catalogType == session.ResourceTypeMeasure
 }
 
 func (toolBridge *ToolBridge) reserveSchemaDescription() bool {
@@ -367,9 +402,20 @@ func (toolBridge *ToolBridge) proposeQueryPlan(ctx context.Context, callID strin
 	if querySession == nil {
 		return Result{Err: fmt.Errorf("query session is not configured")}
 	}
+	plans, planErr := plannedQueries(arguments)
+	if planErr != nil {
+		return jsonResult(map[string]any{
+			"valid":       false,
+			"message":     planErr.Error(),
+			"schema_hint": queryPlanSchemaHint(),
+		})
+	}
 	attempt, allowed := toolBridge.reservePlanAttempt()
 	if !allowed {
-		return Result{Err: fmt.Errorf("automatic query plan repair limit reached after two repairs")}
+		return jsonResult(map[string]any{
+			"valid":   false,
+			"message": "automatic query plan repair limit reached after two repairs",
+		})
 	}
 	if attempt > 1 {
 		toolBridge.emit(agent.Event{
@@ -380,10 +426,6 @@ func (toolBridge *ToolBridge) proposeQueryPlan(ctx context.Context, callID strin
 			Status:    agent.EventStatusRunning,
 			StartedAt: toolBridge.now(),
 		})
-	}
-	plans, planErr := plannedQueries(arguments)
-	if planErr != nil {
-		return Result{Err: planErr}
 	}
 	compiledQueries := make([]planner.CompiledQuery, 0, len(plans))
 	plannedQueries := make([]session.PlannedQuery, 0, len(plans))
@@ -396,17 +438,18 @@ func (toolBridge *ToolBridge) proposeQueryPlan(ctx context.Context, callID strin
 		if !resourceIsDiscoverable(querySession.SchemaSnapshot.Catalog, plan.Resource) {
 			return Result{Err: fmt.Errorf("query plan step %d selects a resource outside the discovered catalog", planIndex+1)}
 		}
-		snapshot, schemaErr := toolBridge.executor.DiscoverSchema(ctx, tools.SchemaRequest{
-			Type:   plan.Resource.Type,
-			Name:   plan.Resource.Name,
-			Groups: plan.Resource.Groups,
-		})
+		snapshot, schemaErr := toolBridge.executor.DiscoverSchema(ctx, schemaRequestForPlan(plan))
 		if schemaErr != nil {
 			return Result{Err: fmt.Errorf("failed to discover schema for plan step %d: %w", planIndex+1, schemaErr)}
 		}
 		compiled, compileErr := planner.Compile(plan, snapshot)
 		if compileErr != nil {
-			return Result{Err: fmt.Errorf("failed to compile query plan step %d: %w", planIndex+1, compileErr)}
+			return jsonResult(map[string]any{
+				"valid":       false,
+				"message":     compileErr.Error(),
+				"step":        planIndex + 1,
+				"schema_hint": queryPlanSchemaHint(),
+			})
 		}
 		validation, validationErr := toolBridge.validator.Validate(ctx, compiled.Query, &snapshot)
 		if validationErr != nil {
@@ -452,6 +495,18 @@ func (toolBridge *ToolBridge) proposeQueryPlan(ctx context.Context, callID strin
 	})
 }
 
+func schemaRequestForPlan(plan planner.QueryPlan) tools.SchemaRequest {
+	resourceType := plan.Resource.Type
+	if resourceType == session.ResourceTypeTopN {
+		resourceType = session.ResourceTypeMeasure
+	}
+	return tools.SchemaRequest{
+		Type:   resourceType,
+		Name:   plan.Resource.Name,
+		Groups: plan.Resource.Groups,
+	}
+}
+
 func resourceIsDiscoverable(catalog []session.CatalogEntry, resource planner.Resource) bool {
 	if len(catalog) == 0 {
 		return true
@@ -459,7 +514,9 @@ func resourceIsDiscoverable(catalog []session.CatalogEntry, resource planner.Res
 	for _, group := range resource.Groups {
 		found := false
 		for _, entry := range catalog {
-			if entry.Type == resource.Type && strings.EqualFold(entry.Name, resource.Name) && strings.EqualFold(entry.Group, group) {
+			if catalogTypesCompatible(resource.Type, entry.Type) &&
+				strings.EqualFold(entry.Name, resource.Name) &&
+				strings.EqualFold(entry.Group, group) {
 				found = true
 				break
 			}
@@ -489,13 +546,13 @@ func plannedQueries(arguments map[string]any) ([]planner.QueryPlan, error) {
 	}
 	if hasPlan {
 		var plan planner.QueryPlan
-		if decodeErr := decodePlanArgument(planValue, &plan); decodeErr != nil {
+		if decodeErr := decodePlanArgument(normalizePlanArgument(planValue), &plan); decodeErr != nil {
 			return nil, fmt.Errorf("invalid query plan: %w", decodeErr)
 		}
 		return []planner.QueryPlan{plan}, nil
 	}
 	var workflow planner.WorkflowPlan
-	if decodeErr := decodePlanArgument(workflowValue, &workflow); decodeErr != nil {
+	if decodeErr := decodePlanArgument(normalizePlanArgument(workflowValue), &workflow); decodeErr != nil {
 		return nil, fmt.Errorf("invalid query workflow: %w", decodeErr)
 	}
 	if len(workflow.Steps) == 0 {

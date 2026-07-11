@@ -89,7 +89,10 @@ func writeRole(prompt *bytes.Buffer) {
 func writeHardRules(prompt *bytes.Buffer, initial bool) {
 	prompt.WriteString("Hard rules:\n")
 	prompt.WriteString("- Never write, validate, or publish a raw BYDBQL statement. Publish candidates only through propose_query_plan.\n")
-	prompt.WriteString("- On a new goal, call list_groups_schemas, rank at most five catalog candidates, and call describe_schema for at most three.\n")
+	prompt.WriteString("- The session working directory is not a codebase. Do not read files, search source, or run shell commands.\n")
+	prompt.WriteString("- On a new goal, your first action must be an MCP tool call: list_groups_schemas, or describe_schema when schema.ranked_candidates already names one resource.\n")
+	prompt.WriteString("- Do not end the turn until propose_query_plan returns valid=true. Free-text BYDBQL is ignored by bydbctl.\n")
+	prompt.WriteString("- On a new goal, rank at most five catalog candidates, and call describe_schema for at most three.\n")
 	prompt.WriteString("- Use only the typed columns returned by describe_schema. Do not invent a resource, group, field, tag, type, or index.\n")
 	prompt.WriteString("- Use only the five provided bydbctl tools. Do not use shell commands, external MCP servers, downloads, or runtime tool registration.\n")
 	prompt.WriteString("- propose_query_plan accepts a plan or workflow. Its result is the only structured candidate that bydbctl will show.\n")
@@ -112,7 +115,7 @@ func writeHardRules(prompt *bytes.Buffer, initial bool) {
 
 func writeNLRules(prompt *bytes.Buffer) {
 	prompt.WriteString("Natural language rules:\n")
-	prompt.WriteString("- schema.catalog is a discovery hint, not a user selection. Select a resource only after inspecting its actual typed schema.\n")
+	prompt.WriteString("- schema.ranked_candidates and schema.catalog are discovery hints, not user selections. Select a resource only after inspecting its actual typed schema.\n")
 	prompt.WriteString("- query_hints.prefer_show_top means use a SHOW TOP plan, not SELECT with LIMIT.\n")
 	prompt.WriteString("- Distinguish time ranges from data-point limits; use the user wording when it is explicit.\n")
 	prompt.WriteString("- A goal spanning multiple resources requires a workflow with one independently approved plan step per resource.\n")
@@ -128,7 +131,10 @@ func writeReferences(prompt *bytes.Buffer) {
 func writeOutputContract(prompt *bytes.Buffer) {
 	prompt.WriteString("Output contract:\n")
 	prompt.WriteString("- Explain the selected schema and result briefly in user-facing language.\n")
-	prompt.WriteString("- A plan has resource(type, name, groups), optional projection/filter/group_by/order_by/time_range/limit, and optional aggregate or top_n.\n")
-	prompt.WriteString("- A workflow has ordered steps, each with the same plan structure; do not emit a fabricated cross-resource join.\n")
-	prompt.WriteString("- Submit the complete structured plan through propose_query_plan; do not embed BYDBQL in free text.\n\n")
+	prompt.WriteString("- Submit propose_query_plan with {\"plan\":{...}} or {\"workflow\":{\"steps\":[...]}} only.\n")
+	prompt.WriteString("- Nest resource fields under resource: {\"type\",\"name\",\"groups\"}. Never put name/type/groups at the plan root.\n")
+	prompt.WriteString("- SHOW TOP goals: resource.type TOPN, top_n as integer, aggregate.function, order_by.direction, time_range.start. No column in aggregate or order_by.\n")
+	prompt.WriteString("- SELECT goals: resource.type MEASURE|STREAM|TRACE|PROPERTY with typed projection/filter/order_by/limit.\n")
+	prompt.WriteString("- When plan_example is present in context JSON, copy its shape and fill columns from describe_schema.\n")
+	prompt.WriteString("- Do not embed BYDBQL in free text; propose_query_plan is the only accepted candidate path.\n\n")
 }

@@ -60,10 +60,13 @@ func newAgentCmd() *cobra.Command {
 			if cmd.Flags().Changed("mcp-config") {
 				return fmt.Errorf("--mcp-config is no longer supported: bydbctl agent only exposes its built-in controlled tools")
 			}
-			workingDirectory, wdErr := os.Getwd()
+			workingDirectory, wdErr := os.MkdirTemp("", "bydbctl-agent-cwd-")
 			if wdErr != nil {
-				return fmt.Errorf("failed to get working directory: %w", wdErr)
+				return fmt.Errorf("failed to create isolated agent working directory: %w", wdErr)
 			}
+			defer func() {
+				_ = os.RemoveAll(workingDirectory)
+			}()
 			executor := tools.NewHTTPExecutor(tools.HTTPConfig{
 				Addr:      viper.GetString("addr"),
 				Username:  viper.GetString("username"),

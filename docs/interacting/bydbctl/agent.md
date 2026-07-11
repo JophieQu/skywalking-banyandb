@@ -63,6 +63,14 @@ The local semantic checks require a `TIME` clause for time-series queries and a 
 | Query / Agent | F2 | Multi-turn conversation, current BYDBQL version, validation and approval |
 | Run / Activity | F3 | Structured result preview and live plan/tool/approval/execution activity |
 
+Tab navigation works globally, including while typing in Query inputs:
+
+| Shortcut | Action |
+| --- | --- |
+| `F1` / `F2` / `F3` | Jump directly to Schema / Query / Run |
+| `[` / `]` | Previous / next tab (works even while typing) |
+| `Ctrl+]` | Next tab (works even while typing) |
+
 On the Query page:
 
 | Shortcut | Action |

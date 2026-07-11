@@ -27,8 +27,9 @@ import (
 )
 
 var (
-	topNPattern    = regexp.MustCompile(`(?i)\b(top|highest|lowest|best|worst)\b`)
-	limitPattern   = regexp.MustCompile(`(?i)\blast\s+(\d+)\s+`)
+	topNPattern     = regexp.MustCompile(`(?i)\b(top|highest|lowest|best|worst)\b`)
+	topLimitPattern = regexp.MustCompile(`(?i)\b(?:top|highest|lowest|best|worst)\s+(\d+)\b`)
+	limitPattern    = regexp.MustCompile(`(?i)\blast\s+(\d+)\s+`)
 	timeUnitPattern = regexp.MustCompile(`(?i)\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)\b`)
 )
 
@@ -46,14 +47,21 @@ func ClassifyIntent(querySession *session.QuerySession) agent.QueryHints {
 	if topNPattern.MatchString(goal) {
 		hints.PreferShowTop = true
 	}
+	if topLimitMatches := topLimitPattern.FindStringSubmatch(goal); len(topLimitMatches) == 2 {
+		if limitValue, parseErr := strconv.Atoi(topLimitMatches[1]); parseErr == nil && limitValue > 0 {
+			hints.LimitHint = limitValue
+		}
+	}
 	if timeMatches := timeUnitPattern.FindStringSubmatch(goal); len(timeMatches) >= 3 {
 		hints.TimeRangeHint = formatRelativeTime(timeMatches[1], timeMatches[2])
 	} else if start := strings.TrimSpace(querySession.TimeRange.Start); start != "" {
 		hints.TimeRangeHint = start
 	}
-	if limitMatches := limitPattern.FindStringSubmatch(goal); len(limitMatches) == 2 {
-		if limitValue, parseErr := strconv.Atoi(limitMatches[1]); parseErr == nil && limitValue > 0 {
-			hints.LimitHint = limitValue
+	if hints.LimitHint == 0 {
+		if limitMatches := limitPattern.FindStringSubmatch(goal); len(limitMatches) == 2 {
+			if limitValue, parseErr := strconv.Atoi(limitMatches[1]); parseErr == nil && limitValue > 0 {
+				hints.LimitHint = limitValue
+			}
 		}
 	}
 	return hints

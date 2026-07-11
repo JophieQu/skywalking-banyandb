@@ -34,6 +34,9 @@ func TestClassifyIntentPreferShowTop(t *testing.T) {
 	if !hints.PreferShowTop {
 		t.Fatal("expected prefer_show_top")
 	}
+	if hints.LimitHint != 10 {
+		t.Fatalf("unexpected limit hint: %d", hints.LimitHint)
+	}
 	if hints.TimeRangeHint != "-30m" {
 		t.Fatalf("unexpected time range hint: %s", hints.TimeRangeHint)
 	}

@@ -32,6 +32,7 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
 	tuibysql "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bydbql"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/planner"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 )
@@ -353,6 +354,13 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 	if runner.toolBridge != nil {
 		runner.toolBridge.SetSession(querySession)
 	}
+	if bootstrapErr := runner.bootstrapAutonomousSchema(ctx, querySession); bootstrapErr != nil {
+		querySession.AddTranscript("workflow", "schema bootstrap: "+bootstrapErr.Error(), runner.now())
+	}
+	rankedCatalog := RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
+	if runner.toolBridge != nil {
+		runner.toolBridge.SetRankedCandidates(RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, 5))
+	}
 	querySession.Phase = session.PhaseAgentDraft
 	agentSessionID := strings.TrimSpace(querySession.AgentSessionID)
 	if agentSessionID == "" {
@@ -383,7 +391,14 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 		)
 	}
 	hints := ClassifyIntent(querySession)
+	rankedCatalog = RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
 	payload := agent.BuildAgentTurnRequest(querySession, hints, templateHint, trimmedTurnHint)
+	payload.Schema.CatalogTotal = len(querySession.SchemaSnapshot.Catalog)
+	if len(rankedCatalog) > 0 {
+		payload.Schema.RankedCandidates = agent.CatalogEntrySummaries(rankedCatalog)
+		payload.Schema.Catalog = payload.Schema.RankedCandidates
+	}
+	payload.PlanExample = buildStructuredPlanExample(querySession, hints)
 	agentEvents, sendErr := runner.sendAgentTurn(ctx, agentSessionID, payload)
 	if sendErr != nil {
 		querySession.Phase = session.PhaseError
@@ -411,6 +426,58 @@ func (runner *Runner) StopAgentTurn(ctx context.Context, querySession *session.Q
 	return nil
 }
 
+func (runner *Runner) bootstrapAutonomousSchema(ctx context.Context, querySession *session.QuerySession) error {
+	if querySession == nil || runner.executor == nil {
+		return nil
+	}
+	if strings.TrimSpace(querySession.ResourceName) != "" {
+		return nil
+	}
+	if len(querySession.SchemaSnapshot.Catalog) == 0 {
+		return nil
+	}
+	match := matchResourceFromGoal(
+		querySession.UserGoal,
+		session.SchemaCatalog{Entries: querySession.SchemaSnapshot.Catalog},
+		"",
+		"",
+		nil,
+	)
+	if !match.Matched {
+		return nil
+	}
+	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
+		Type:   match.Type,
+		Name:   match.Name,
+		Groups: []string{match.Group},
+	})
+	if schemaErr != nil {
+		return fmt.Errorf("failed to preload matched schema: %w", schemaErr)
+	}
+	schemaSnapshot.AvailableGroups = append([]string(nil), querySession.SchemaSnapshot.AvailableGroups...)
+	schemaSnapshot.Catalog = append([]session.CatalogEntry(nil), querySession.SchemaSnapshot.Catalog...)
+	querySession.ResourceType = match.Type
+	querySession.ResourceName = match.Name
+	querySession.Groups = []string{match.Group}
+	querySession.SchemaSnapshot = schemaSnapshot
+	querySession.AutoMatched = true
+	querySession.AddTranscript(
+		"workflow",
+		fmt.Sprintf("preloaded schema for %s %s in %s", match.Type, match.Name, match.Group),
+		runner.now(),
+	)
+	if runner.toolBridge != nil {
+		runner.toolBridge.SetSession(querySession)
+		matchedEntry := session.CatalogEntry{Group: match.Group, Type: match.Type, Name: match.Name}
+		runner.toolBridge.SetRankedCandidates(EnsureCatalogEntry(
+			RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, 5),
+			matchedEntry,
+			5,
+		))
+	}
+	return nil
+}
+
 func (runner *Runner) streamAgentTurn(
 	ctx context.Context,
 	querySession *session.QuerySession,
@@ -424,6 +491,10 @@ func (runner *Runner) streamAgentTurn(
 	for agentEvents != nil {
 		select {
 		case <-ctx.Done():
+			if completeErr := runner.completeAgentTurn(ctx, querySession, turnHint, collectedEvents); completeErr == nil {
+				updates <- TurnUpdate{Done: true, QuerySession: querySession}
+				return
+			}
 			querySession.Phase = session.PhaseReady
 			updates <- TurnUpdate{Done: true, Err: ctx.Err(), QuerySession: querySession}
 			return
@@ -434,7 +505,9 @@ func (runner *Runner) streamAgentTurn(
 				continue
 			}
 			collectedEvents = append(collectedEvents, event)
-			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			if shouldForwardAgentTurnEvent(event) {
+				updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			}
 			if event.Kind == agent.EventKindError {
 				querySession.Phase = session.PhaseError
 				errorValue := event.Err
@@ -446,7 +519,9 @@ func (runner *Runner) streamAgentTurn(
 			}
 		case event := <-toolEvents:
 			collectedEvents = append(collectedEvents, event)
-			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			if shouldForwardAgentTurnEvent(event) {
+				updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			}
 		}
 	}
 	completeErr := runner.completeAgentTurn(ctx, querySession, turnHint, collectedEvents)
@@ -466,7 +541,9 @@ func drainBridgeEvents(
 		select {
 		case event := <-toolEvents:
 			collectedEvents = append(collectedEvents, event)
-			updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			if shouldForwardAgentTurnEvent(event) {
+				updates <- TurnUpdate{Event: &event, QuerySession: querySession}
+			}
 		default:
 			return collectedEvents
 		}
@@ -480,8 +557,21 @@ func bridgeEvents(toolBridge *bridge.ToolBridge) <-chan agent.Event {
 	return toolBridge.Events()
 }
 
+func shouldForwardAgentTurnEvent(event agent.Event) bool {
+	return event.Kind != agent.EventKindMessageDelta
+}
+
 func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string, turnEvents []agent.Event) error {
 	candidate := finalCandidate(turnEvents)
+	fallbackExplanation := ""
+	if strings.TrimSpace(candidate) == "" {
+		fallbackCandidate, explanation, fallbackErr := runner.compileFallbackCandidate(ctx, querySession)
+		if fallbackErr == nil && strings.TrimSpace(fallbackCandidate) != "" {
+			candidate = fallbackCandidate
+			fallbackExplanation = explanation
+			querySession.AddTranscript("workflow", "compiled fallback query plan from goal and preloaded schema", runner.now())
+		}
+	}
 	if strings.TrimSpace(candidate) == "" {
 		querySession.Phase = session.PhaseValidate
 		outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
@@ -496,6 +586,9 @@ func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *sessi
 		return fmt.Errorf("failed to validate agent candidate: %w", validationErr)
 	}
 	explanation := finalExplanation(turnEvents)
+	if fallbackExplanation != "" {
+		explanation = fallbackExplanation
+	}
 	querySession.AddCandidate(session.BydbqlCandidate{
 		ID:          fmt.Sprintf("candidate-%d", len(querySession.Candidates)+1),
 		Query:       candidate,
@@ -665,6 +758,120 @@ func (runner *Runner) executionApproval(querySession *session.QuerySession, quer
 	resource := fmt.Sprintf("%s/%s", querySession.ResourceType, querySession.ResourceName)
 	limits := tools.Limits(runner.executor)
 	return approval.WithLimits(approval.NewRequest(query, resource, querySession.Groups, source), limits.Timeout, limits.PreviewRows)
+}
+
+func buildStructuredPlanExample(querySession *session.QuerySession, hints agent.QueryHints) map[string]any {
+	if querySession == nil || strings.TrimSpace(querySession.ResourceName) == "" {
+		return nil
+	}
+	groups := normalizeGroups(querySession.Groups)
+	if len(groups) == 0 {
+		return nil
+	}
+	timeStart := strings.TrimSpace(hints.TimeRangeHint)
+	if timeStart == "" {
+		timeStart = strings.TrimSpace(querySession.TimeRange.Start)
+	}
+	if timeStart == "" {
+		timeStart = "-30m"
+	}
+	resource := map[string]any{
+		"name":   querySession.ResourceName,
+		"groups": groups,
+	}
+	planExample := map[string]any{
+		"resource":    resource,
+		"time_range":  map[string]any{"start": timeStart},
+		"order_by":    map[string]any{"direction": "DESC"},
+		"aggregate":   map[string]any{"function": "MEAN"},
+	}
+	if hints.PreferShowTop || querySession.ResourceType == session.ResourceTypeTopN {
+		resource["type"] = session.ResourceTypeTopN.String()
+		topN := hints.LimitHint
+		if topN <= 0 {
+			topN = defaultTopN
+		}
+		planExample["top_n"] = topN
+		return map[string]any{"plan": planExample}
+	}
+	resource["type"] = querySession.ResourceType.String()
+	limit := hints.LimitHint
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	planExample["limit"] = limit
+	return map[string]any{"plan": planExample}
+}
+
+func (runner *Runner) compileFallbackCandidate(ctx context.Context, querySession *session.QuerySession) (string, string, error) {
+	if querySession == nil || !querySession.SchemaSnapshot.Loaded {
+		return "", "", errors.New("preloaded schema is required for fallback compilation")
+	}
+	hints := ClassifyIntent(querySession)
+	plan, ok := buildFallbackQueryPlan(querySession, hints)
+	if !ok {
+		return "", "", errors.New("unable to derive a fallback query plan from the session")
+	}
+	compiled, compileErr := planner.Compile(plan, querySession.SchemaSnapshot)
+	if compileErr != nil {
+		return "", "", fmt.Errorf("failed to compile fallback query plan: %w", compileErr)
+	}
+	validation, validationErr := runner.validator.Validate(ctx, compiled.Query, &querySession.SchemaSnapshot)
+	if validationErr != nil {
+		return "", "", fmt.Errorf("failed to validate fallback query plan: %w", validationErr)
+	}
+	if !validation.Valid {
+		return "", "", fmt.Errorf("fallback query plan is invalid: %s", validation.Message)
+	}
+	explanation := fmt.Sprintf(
+		"Auto-compiled %s query on %s in %s from goal",
+		strings.ToUpper(plan.Resource.Type.String()),
+		plan.Resource.Name,
+		strings.Join(plan.Resource.Groups, ", "),
+	)
+	return compiled.Query, explanation, nil
+}
+
+func buildFallbackQueryPlan(querySession *session.QuerySession, hints agent.QueryHints) (planner.QueryPlan, bool) {
+	resourceName := strings.TrimSpace(querySession.ResourceName)
+	groups := normalizeGroups(querySession.Groups)
+	if resourceName == "" || len(groups) == 0 {
+		return planner.QueryPlan{}, false
+	}
+	timeStart := strings.TrimSpace(hints.TimeRangeHint)
+	if timeStart == "" {
+		timeStart = strings.TrimSpace(querySession.TimeRange.Start)
+	}
+	if timeStart == "" {
+		timeStart = defaultTimeStart
+	}
+	plan := planner.QueryPlan{
+		TimeRange: planner.TimeRange{Start: timeStart},
+	}
+	if hints.PreferShowTop || querySession.ResourceType == session.ResourceTypeTopN {
+		plan.Resource = planner.Resource{
+			Type:   session.ResourceTypeTopN,
+			Name:   resourceName,
+			Groups: groups,
+		}
+		plan.TopN = hints.LimitHint
+		if plan.TopN <= 0 {
+			plan.TopN = defaultTopN
+		}
+		plan.Aggregate = &planner.Aggregate{Function: planner.AggregateMean}
+		plan.OrderBy = &planner.Order{Direction: planner.OrderDescending}
+		return plan, true
+	}
+	plan.Resource = planner.Resource{
+		Type:   querySession.ResourceType,
+		Name:   resourceName,
+		Groups: groups,
+	}
+	plan.Limit = hints.LimitHint
+	if plan.Limit <= 0 {
+		plan.Limit = defaultLimit
+	}
+	return plan, true
 }
 
 // BuildTemplateQuery creates the deterministic starter query for a resource.

@@ -471,6 +471,9 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 	case "f3":
 		m.switchTab(tabRun)
 		return m.syncFocus(), true
+	case "ctrl+]":
+		m.cycleTab(1)
+		return m.syncFocus(), true
 	case "tab":
 		m.cycleFocus(1)
 		return m.syncFocus(), true
@@ -492,9 +495,6 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, false
 	case "[", "]":
-		if m.isTypingFocus() {
-			return nil, false
-		}
 		delta := -1
 		if keyMsg.String() == "]" {
 			delta = 1
@@ -905,6 +905,8 @@ func shouldShowAgentEvent(event agent.Event) bool {
 	switch event.Kind {
 	case agent.EventKindMessageDelta:
 		return false
+	case agent.EventKindPermissionRequest:
+		return !strings.Contains(strings.ToLower(event.Message), "granted")
 	default:
 		return true
 	}

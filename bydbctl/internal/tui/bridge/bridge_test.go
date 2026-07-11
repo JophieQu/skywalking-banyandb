@@ -121,6 +121,9 @@ func TestBridgeRejectsPlanResourceOutsideDiscoveredCatalog(t *testing.T) {
 	toolBridge.SetSession(&session.QuerySession{SchemaSnapshot: session.SchemaSnapshot{Catalog: []session.CatalogEntry{
 		{Group: "production", Type: session.ResourceTypeMeasure, Name: "service_latency"},
 	}}})
+	toolBridge.SetRankedCandidates([]session.CatalogEntry{
+		{Group: "production", Type: session.ResourceTypeMeasure, Name: "service_latency"},
+	})
 	result := toolBridge.Call(context.Background(), Call{Name: ToolProposeQueryPlan, Arguments: map[string]any{
 		"plan": map[string]any{
 			"resource": map[string]any{"type": "MEASURE", "name": "invented", "groups": []any{"production"}},
@@ -294,12 +297,12 @@ func TestBridgeLimitsAutomaticPlanRepairsToTwoAfterTheInitialAttempt(t *testing.
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		result := toolBridge.Call(context.Background(), Call{Name: ToolProposeQueryPlan, Arguments: map[string]any{"plan": invalidPlan}})
-		if result.Err == nil || strings.Contains(result.Err.Error(), "repair limit") {
+		if result.Err != nil || !strings.Contains(result.Content, `"valid":false`) || strings.Contains(result.Content, "repair limit") {
 			t.Fatalf("expected repairable proposal failure at attempt %d, got %+v", attempt+1, result)
 		}
 	}
 	result := toolBridge.Call(context.Background(), Call{Name: ToolProposeQueryPlan, Arguments: map[string]any{"plan": invalidPlan}})
-	if result.Err == nil || !strings.Contains(result.Err.Error(), "repair limit") {
+	if result.Err != nil || !strings.Contains(result.Content, "repair limit") {
 		t.Fatalf("expected repair limit after two automatic repairs, got %+v", result)
 	}
 }

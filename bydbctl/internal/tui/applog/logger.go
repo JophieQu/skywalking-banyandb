@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,10 +115,12 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 		return
 	}
 	deltaCount := 0
-	var otherKinds []string
+	kindCounts := make(map[string]int)
 	var candidate string
 	var agentErr error
+	var toolFailures []string
 	for _, event := range events {
+		kindCounts[string(event.Kind)]++
 		switch event.Kind {
 		case agent.EventKindMessageDelta:
 			if strings.TrimSpace(event.Message) != "" {
@@ -131,16 +134,21 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 			if event.Err != nil {
 				agentErr = event.Err
 			}
-		default:
-			otherKinds = append(otherKinds, string(event.Kind))
+		case agent.EventKindToolResult:
+			if event.Status == agent.EventStatusFailed && strings.TrimSpace(event.Message) != "" {
+				toolFailures = append(toolFailures, event.ToolName+": "+event.Message)
+			}
 		}
 	}
 	parts := []string{fmt.Sprintf("events=%d", len(events))}
 	if deltaCount > 0 {
 		parts = append(parts, fmt.Sprintf("non_empty_deltas=%d", deltaCount))
 	}
-	if len(otherKinds) > 0 {
-		parts = append(parts, "kinds="+strings.Join(otherKinds, ","))
+	if len(kindCounts) > 0 {
+		parts = append(parts, "kinds="+summarizeKindCounts(kindCounts))
+	}
+	if len(toolFailures) > 0 {
+		parts = append(parts, "tool_failures="+strings.Join(toolFailures, "; "))
 	}
 	if candidate != "" {
 		parts = append(parts, "candidate="+truncateLogField(candidate))
@@ -149,6 +157,22 @@ func (sessionLogger *Logger) WriteAgentTurn(events []agent.Event) {
 		parts = append(parts, "error="+agentErr.Error())
 	}
 	sessionLogger.Write("agent_turn", strings.Join(parts, " | "))
+}
+
+func summarizeKindCounts(kindCounts map[string]int) string {
+	if len(kindCounts) == 0 {
+		return ""
+	}
+	kinds := make([]string, 0, len(kindCounts))
+	for kind := range kindCounts {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	parts := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		parts = append(parts, fmt.Sprintf("%s=%d", kind, kindCounts[kind]))
+	}
+	return strings.Join(parts, ",")
 }
 
 func truncateLogField(value string) string {

@@ -674,6 +674,46 @@ func (executor *catalogExecutor) Execute(_ context.Context, _ *session.QuerySess
 	return executor.result, nil
 }
 
+func TestCompleteAgentTurnUsesFallbackWhenAgentSkipsPlanProposal(t *testing.T) {
+	runner := NewRunner(Config{
+		Validator: &sequenceValidator{reports: []session.ValidationReport{{Valid: true, Message: "valid", QueryType: "TOPN"}}},
+	})
+	querySession := &session.QuerySession{
+		UserGoal:     "top 10 slow payment endpoints in last 30 minutes",
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_endpoint_latency",
+		Groups:       []string{"sw_metrics"},
+		AutoMatched:  true,
+		SchemaSnapshot: session.SchemaSnapshot{
+			Type:   session.ResourceTypeMeasure,
+			Name:   "service_endpoint_latency",
+			Groups: []string{"sw_metrics"},
+			Loaded: true,
+			Columns: []session.SchemaColumn{
+				{Name: "endpoint", Kind: session.SchemaColumnTag, Type: session.SchemaValueTypeString, Indexed: true},
+				{Name: "latency", Kind: session.SchemaColumnField, Type: session.SchemaValueTypeFloat},
+			},
+		},
+	}
+	completeErr := runner.completeAgentTurn(context.Background(), querySession, "", []agent.Event{
+		{Kind: agent.EventKindFinalResponse, Message: "schema confirmed"},
+	})
+	if completeErr != nil {
+		t.Fatalf("completeAgentTurn returned error: %v", completeErr)
+	}
+	candidate := querySession.CurrentCandidate()
+	if candidate == nil {
+		t.Fatal("expected fallback candidate")
+	}
+	want := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN sw_metrics TIME > '-30m' AGGREGATE BY MEAN ORDER BY DESC"
+	if candidate.Query != want {
+		t.Fatalf("unexpected fallback query:\nwant: %s\n got: %s", want, candidate.Query)
+	}
+	if querySession.Phase != session.PhaseReady {
+		t.Fatalf("expected ready phase, got %s", querySession.Phase)
+	}
+}
+
 type sequenceValidator struct {
 	reports []session.ValidationReport
 	calls   int
