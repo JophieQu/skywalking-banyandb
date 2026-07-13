@@ -24,6 +24,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/workflow"
 )
 
 var (
@@ -57,18 +58,6 @@ var (
 			Foreground(redColor)
 )
 
-func (m Model) renderHeader(width int) string {
-	title := titleStyle.Render("bydbctl agent")
-	subtitle := mutedStyle.Render("F1 schema · F2 query/agent · F3 run/debug")
-	chips := lipgloss.JoinHorizontal(lipgloss.Top,
-		activeChipStyle.Render("provider "+m.provider),
-		" ",
-		chipStyle.Render(m.currentPhaseLabel()),
-	)
-	line := lipgloss.JoinHorizontal(lipgloss.Top, title, "  ", chips)
-	return lipgloss.NewStyle().Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, line, subtitle))
-}
-
 func (m Model) currentPhaseLabel() string {
 	if m.querySession == nil {
 		return "phase intent"
@@ -80,15 +69,11 @@ func (m Model) renderQueryTab(width, height int) string {
 	if width < 100 {
 		return m.renderNarrowQueryTab(width, height)
 	}
-	leftWidth := clamp(width*48/100, 40, 80)
-	rightWidth := width - leftWidth - 2
-	queryHeight := clamp(height-14, 10, 24)
-	m.query.SetHeight(queryHeight)
+	leftWidth, rightWidth := queryTabWidths(width)
+	chatHeight := m.chatPanelHeight(height)
 	left := lipgloss.JoinVertical(lipgloss.Left,
-		m.renderGoal(leftWidth),
-		m.renderConversation(leftWidth),
-		m.renderTurnHint(leftWidth),
-		m.renderSlots(leftWidth),
+		m.renderChat(leftWidth, chatHeight),
+		m.renderMessage(leftWidth),
 		m.renderStatusLine(leftWidth),
 	)
 	right := lipgloss.JoinVertical(lipgloss.Left,
@@ -99,14 +84,19 @@ func (m Model) renderQueryTab(width, height int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 }
 
+func queryTabWidths(width int) (int, int) {
+	if width < 100 {
+		return width, width
+	}
+	leftWidth := clamp(width*58/100, 52, 108)
+	return leftWidth, width - leftWidth - 2
+}
+
 func (m Model) renderNarrowQueryTab(width, height int) string {
-	queryHeight := clamp(height/3, 6, 12)
-	m.query.SetHeight(queryHeight)
+	chatHeight := m.chatPanelHeight(height)
 	left := lipgloss.JoinVertical(lipgloss.Left,
-		m.renderGoal(width),
-		m.renderConversation(width),
-		m.renderTurnHint(width),
-		m.renderSlots(width),
+		m.renderChat(width, chatHeight),
+		m.renderMessage(width),
 		m.renderStatusLine(width),
 	)
 	right := lipgloss.JoinVertical(lipgloss.Left,
@@ -126,55 +116,209 @@ func (m Model) renderStatusLine(width int) string {
 	if m.querySession != nil && m.querySession.Validation.Message != "" {
 		validation = m.querySession.Validation.Status()
 	}
-	return panelStyle.Width(width).Render(mutedStyle.Render(fmt.Sprintf("Status: %s · Validation: %s", status, validation)))
-}
-
-func (m Model) renderGoal(width int) string {
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("Goal"), m.goal.View()))
-}
-
-func (m Model) renderTurnHint(width int) string {
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("Next instruction (Ctrl+A)"), m.turnHint.View()))
-}
-
-func (m Model) renderConversation(width int) string {
-	rows := []string{titleStyle.Render("Assistant workspace")}
-	if m.querySession == nil || len(m.querySession.Transcript) == 0 {
-		rows = append(rows, mutedStyle.Render("Describe the goal, then press Ctrl+A."))
-	} else {
-		startIdx := maxInt(len(m.querySession.Transcript)-4, 0)
-		for _, entry := range m.querySession.Transcript[startIdx:] {
-			role := entry.Role
-			if role == "" {
-				role = "assistant"
-			}
-			rows = append(rows, fmt.Sprintf("%s: %s", role, truncate(singleLine(entry.Content), width-12)))
-		}
+	reasoning := "off"
+	if m.showReasoning {
+		reasoning = "on"
 	}
-	if strings.TrimSpace(m.liveResponse) != "" {
-		rows = append(rows, "assistant: "+wrapText(m.liveResponse, width-12))
+	statusLine := mutedStyle.Render(fmt.Sprintf(
+		"Status: %s · Validation: %s · Policy: %s (Ctrl+P) · Reasoning: %s (Ctrl+R)",
+		status,
+		validation,
+		m.executionPolicy.Label(),
+		reasoning,
+	))
+	startLabelStyle := mutedStyle
+	if m.focus == focusStart {
+		startLabelStyle = titleStyle
+	}
+	endLabelStyle := mutedStyle
+	if m.focus == focusEnd {
+		endLabelStyle = titleStyle
+	}
+	timeRangeLine := lipgloss.JoinHorizontal(lipgloss.Top,
+		mutedStyle.Render("Time: "),
+		startLabelStyle.Render("start "),
+		m.start.View(),
+		mutedStyle.Render("  →  "),
+		endLabelStyle.Render("end "),
+		m.end.View(),
+	)
+	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, statusLine, timeRangeLine))
+}
+
+func (m Model) renderMessage(width int) string {
+	return panelStyle.Width(width).Render(lipgloss.JoinVertical(
+		lipgloss.Left,
+		titleStyle.Render("Message · Ctrl+A to send"),
+		m.message.View(),
+		mutedStyle.Render("Ask a follow-up, refine the QL, or request a query."),
+	))
+}
+
+func (m Model) renderChat(width, panelHeight int) string {
+	rows := []string{
+		titleStyle.Render("Conversation"),
+		mutedStyle.Render("↑↓ messages · pgup/pgdn detail · Tab focus message"),
+	}
+	entries := chatEntries(m.querySession, m.showReasoning, m.liveResponse, m.queuedMessage)
+	if len(entries) == 0 {
+		rows = append(rows, mutedStyle.Render("Start a conversation. Your sent message appears here immediately."))
+	} else {
+		detailViewportHeight := 0
+		detailLines := []string(nil)
+		if m.chatCursor >= 0 && m.chatCursor < len(entries) {
+			selected := entries[m.chatCursor]
+			if strings.TrimSpace(selected.detail) != "" {
+				detailViewportHeight = chatDetailViewportHeight(panelHeight)
+				detailLines = formatChatDetailLines(selected.detail, width-4)
+			}
+		}
+		listViewportHeight := maxInt(panelHeight-8-detailViewportHeight-2, 4)
+		endIdx := minInt(m.chatScroll+listViewportHeight, len(entries))
+		for entryIdx := m.chatScroll; entryIdx < endIdx; entryIdx++ {
+			entry := entries[entryIdx]
+			lineStyle := mutedStyle
+			prefix := " "
+			if entryIdx == m.chatCursor {
+				prefix = ">"
+				lineStyle = activeChipStyle
+			}
+			switch entry.role {
+			case session.ChatRoleUser:
+				if entryIdx != m.chatCursor {
+					lineStyle = titleStyle
+				}
+			case session.ChatRoleTool:
+				if entryIdx != m.chatCursor {
+					lineStyle = warnStyle
+				}
+			case session.ChatRoleAssistant:
+				if entryIdx != m.chatCursor {
+					lineStyle = okStyle
+				}
+			}
+			rows = append(rows, lineStyle.Render(prefix+truncate(entry.headline, width-12)))
+		}
+		if len(detailLines) > 0 {
+			rows = append(rows, titleStyle.Render("Detail · pgup/pgdn scroll"))
+			detailEnd := minInt(m.chatDetailScroll+detailViewportHeight, len(detailLines))
+			for lineIdx := m.chatDetailScroll; lineIdx < detailEnd; lineIdx++ {
+				line := renderChatDetailLine(detailLines[lineIdx])
+				if lipgloss.Width(line) > width-4 {
+					line = truncateANSI(line, width-4)
+				}
+				rows = append(rows, line)
+			}
+			if len(detailLines) > detailViewportHeight {
+				rows = append(rows, mutedStyle.Render(fmt.Sprintf(
+					"detail %d-%d/%d lines",
+					m.chatDetailScroll+1,
+					detailEnd,
+					len(detailLines),
+				)))
+			}
+		}
+		rows = append(rows, mutedStyle.Render(fmt.Sprintf("%d/%d messages", endIdx, len(entries))))
 	}
 	if m.busy {
-		rows = append(rows, warnStyle.Render("live activity is updating…"))
+		rows = append(rows, warnStyle.Render("agent turn in progress…"))
 	}
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return panelStyle.Width(width).Height(panelHeight).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
 }
 
-func (m Model) renderSlots(width int) string {
-	rows := []string{titleStyle.Render("Autonomous discovery")}
-	if m.querySession == nil || strings.TrimSpace(m.querySession.ResourceName) == "" {
-		rows = append(rows, mutedStyle.Render("The agent will inspect the catalog and choose a schema."))
-	} else {
-		rows = append(rows,
-			m.slotRow("Selected", activeChipStyle.Render(m.querySession.ResourceType.String()+"/"+m.querySession.ResourceName)),
-			m.slotRow("Groups", strings.Join(m.querySession.Groups, ", ")),
-		)
+type chatEntryView struct {
+	role     session.ChatRole
+	headline string
+	detail   string
+}
+
+func chatEntryCount(querySession *session.QuerySession, showReasoning bool, liveResponse, queuedMessage string) int {
+	return len(chatEntries(querySession, showReasoning, liveResponse, queuedMessage))
+}
+
+func chatEntries(querySession *session.QuerySession, showReasoning bool, liveResponse, queuedMessage string) []chatEntryView {
+	chatMessageCount := 0
+	if querySession != nil {
+		chatMessageCount = len(querySession.ChatMessages)
 	}
-	rows = append(rows,
-		m.slotRow("Start", m.start.View()),
-		m.slotRow("End", m.end.View()),
-	)
-	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+	entries := make([]chatEntryView, 0, chatMessageCount+2)
+	if querySession != nil {
+		for _, message := range querySession.ChatMessages {
+			entries = append(entries, chatEntryFromMessage(message))
+		}
+	}
+	if queued := strings.TrimSpace(queuedMessage); queued != "" {
+		entries = append(entries, chatEntryView{
+			role:     session.ChatRoleUser,
+			headline: "You › " + queued,
+		})
+	}
+	if showReasoning && strings.TrimSpace(liveResponse) != "" {
+		entries = append(entries, chatEntryView{
+			role:     session.ChatRoleAssistant,
+			headline: "reasoning: " + truncateRunes(singleLine(liveResponse), 96),
+			detail:   workflow.NormalizeAgentDisplayText(liveResponse),
+		})
+	}
+	return entries
+}
+
+func chatEntryFromMessage(message session.ChatMessage) chatEntryView {
+	content := workflow.NormalizeAgentDisplayText(strings.TrimSpace(message.Content))
+	headline := chatRoleLabel(message.Role) + singleLine(content)
+	detail := content
+	if structuredDetail := strings.TrimSpace(message.Detail); structuredDetail != "" {
+		detail = workflow.NormalizeAgentDisplayText(structuredDetail)
+	}
+	if message.ToolName != "" {
+		headline = chatRoleLabel(message.Role) + message.ToolName + ": " + singleLine(content)
+	}
+	if strings.TrimSpace(message.Candidate) != "" {
+		status := "unchecked"
+		if message.Validation != nil {
+			status = message.Validation.Status()
+		}
+		candidate := strings.TrimSpace(message.Candidate)
+		candidateLine := chatRoleLabel(message.Role) + "candidate [" + status + "]: " + singleLine(candidate)
+		compactDetail := strings.ReplaceAll(strings.ReplaceAll(detail, " ", ""), "\n", "")
+		compactCandidate := strings.ReplaceAll(candidate, " ", "")
+		if detail == "" {
+			headline = candidateLine
+			detail = candidate
+		} else if !strings.Contains(compactDetail, compactCandidate) {
+			detail = appendCandidateDetail(detail, candidate, status)
+		}
+		if message.Role == session.ChatRoleAssistant && strings.TrimSpace(content) == "" {
+			headline = candidateLine
+		}
+	}
+	if headline == chatRoleLabel(message.Role) {
+		headline = chatRoleLabel(message.Role) + "(empty)"
+		detail = ""
+	}
+	return chatEntryView{role: message.Role, headline: headline, detail: detail}
+}
+
+func chatLines(querySession *session.QuerySession, showReasoning bool, liveResponse string) []string {
+	entries := chatEntries(querySession, showReasoning, liveResponse, "")
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, entry.headline)
+	}
+	return lines
+}
+
+func chatRoleLabel(role session.ChatRole) string {
+	switch role {
+	case session.ChatRoleUser:
+		return "You › "
+	case session.ChatRoleTool:
+		return "  ↳ "
+	case session.ChatRoleSystem:
+		return "System › "
+	default:
+		return "Agent › "
+	}
 }
 
 func (m Model) renderWorkflow(width int) string {
@@ -205,32 +349,51 @@ func (m Model) renderCandidateHistory(width int) string {
 	candidateCount := 0
 	selectedCandidate := -1
 	diff := "no previous version"
+	probeSummary := "not probed"
+	candidateSuperseded := false
 	if m.querySession != nil {
 		report = m.querySession.Validation
 		candidateCount = len(m.querySession.Candidates)
 		selectedCandidate = m.querySession.SelectedCandidateIndex()
+		candidateSuperseded = m.querySession.CandidateSuperseded
 		diff = candidateDiff(m.querySession)
+		if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil && currentCandidate.Probe != nil {
+			probe := currentCandidate.Probe
+			if probe.Error != "" {
+				probeSummary = probe.Error
+			} else {
+				probeSummary = fmt.Sprintf("%d rows, %d columns", probe.Rows, len(probe.Columns))
+			}
+		}
 	}
 	previewSharing := "automatic (up to 50 rows)"
 	status := badStyle.Render(report.Status())
 	if report.Valid {
 		status = okStyle.Render(report.Status())
+	} else if candidateSuperseded && candidateCount == 0 {
+		status = mutedStyle.Render("not checked")
 	}
 	rows := []string{
 		titleStyle.Render("Versions / validation"),
 		fmt.Sprintf("Validation: %s", status),
 		fmt.Sprintf("Query type: %s", fallback(report.QueryType, "-")),
 		fmt.Sprintf("Version: %d/%d (Ctrl+←/→)", selectedCandidate+1, candidateCount),
-		"Message: " + truncate(fallback(report.Message, "-"), width-12),
-		"Diff: " + truncate(diff, width-9),
-		"Preview sharing: " + previewSharing,
 	}
+	if candidateSuperseded {
+		rows = append(rows, warnStyle.Render("Candidate superseded by a new topic — waiting for agent draft"))
+	}
+	rows = append(rows,
+		"Message: "+truncate(fallback(report.Message, "-"), width-12),
+		"Probe: "+truncate(probeSummary, width-9),
+		"Diff: "+truncate(diff, width-9),
+		"Preview sharing: "+previewSharing,
+	)
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
 }
 
 func (m Model) renderApproval(width int) string {
 	if m.pendingApproval == nil {
-		return panelStyle.Width(width).Render(mutedStyle.Render("Execution requires one-time approval after Ctrl+E or an agent execution request."))
+		return panelStyle.Width(width).Render(mutedStyle.Render("Read-only BYDBQL runs automatically. Mutating statements still require approval."))
 	}
 	request := *m.pendingApproval
 	rows := []string{
@@ -243,6 +406,7 @@ func (m Model) renderApproval(width int) string {
 		"Limit: " + fallback(request.Limit, "-"),
 		"Timeout: " + request.Timeout.String(),
 		fmt.Sprintf("Preview rows: %d", request.PreviewRows),
+		"Source: " + string(request.Source),
 		warnStyle.Render("y execute once · n reject · e copy to editor and revise"),
 	}
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
@@ -287,20 +451,6 @@ func (m Model) renderFooter(width int) string {
 	return m.footerForTab(width)
 }
 
-func (m Model) slotRow(label, value string) string {
-	focused := map[int]string{
-		focusCatalogFilter: "Filter",
-		focusTurnHint:      "Turn hint (Ctrl+A)",
-		focusStart:         "Start",
-		focusEnd:           "End",
-	}
-	labelStyle := mutedStyle
-	if focused[m.focus] == label {
-		labelStyle = titleStyle
-	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Width(10).Render(label), value)
-}
-
 func fallback(value, fallbackValue string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallbackValue
@@ -315,9 +465,13 @@ func truncate(value string, maxWidth int) string {
 	if lipgloss.Width(value) <= maxWidth {
 		return value
 	}
-	runes := []rune(value)
+	runes := []rune(stripANSI(value))
 	for len(runes) > 0 && lipgloss.Width(string(runes)) > maxWidth-3 {
 		runes = runes[:len(runes)-1]
 	}
 	return string(runes) + "..."
+}
+
+func truncateANSI(value string, maxWidth int) string {
+	return truncate(value, maxWidth)
 }

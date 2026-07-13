@@ -36,15 +36,15 @@ func TestHandleKeyBracketTabsWorkWhileTyping(t *testing.T) {
 	if model.activeTab != tabRun {
 		t.Fatalf("expected run tab, got %v", model.activeTab)
 	}
-	if model.focus != focusActivity {
-		t.Fatalf("expected activity focus, got %d", model.focus)
+	if model.focus != focusExecution {
+		t.Fatalf("expected execution focus, got %d", model.focus)
 	}
 }
 
 func TestHandleKeyCtrlCloseBracketTabsWorkWhileTyping(t *testing.T) {
 	model := NewModel(Config{})
 	model.activeTab = tabQuery
-	model.focus = focusGoal
+	model.focus = focusMessage
 
 	_, handled := model.handleKey(tea.KeyMsg{Type: tea.KeyCtrlCloseBracket})
 	if !handled {

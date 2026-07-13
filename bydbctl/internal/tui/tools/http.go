@@ -1013,7 +1013,31 @@ func firstArray(value any) []any {
 	return nil
 }
 
+var (
+	previewSkipTagKeys = map[string]struct{}{
+		"tags_raw_data": {},
+	}
+	preferredPreviewColumns = []string{
+		"timestamp",
+		"trace_id",
+		"endpoint_id",
+		"content",
+		"service_id",
+		"service_instance_id",
+		"span_id",
+		"tags",
+		"elementId",
+		"unique_id",
+		"trace_segment_id",
+	}
+)
+
 func previewColumns(items []any, maxRows int) []string {
+	if len(items) > 0 {
+		if flat := flattenPreviewItem(items[0]); len(flat) > 0 {
+			return orderedPreviewColumns(flat)
+		}
+	}
 	columnSet := make(map[string]struct{})
 	for _, item := range items[:minimum(len(items), maxRows)] {
 		object, ok := item.(map[string]any)
@@ -1033,6 +1057,13 @@ func previewColumns(items []any, maxRows int) []string {
 }
 
 func previewRow(item any, columns []string) []string {
+	if flat := flattenPreviewItem(item); len(flat) > 0 {
+		row := make([]string, 0, len(columns))
+		for _, column := range columns {
+			row = append(row, flat[column])
+		}
+		return row
+	}
 	row := make([]string, 0, len(columns))
 	object, objectOK := item.(map[string]any)
 	for _, column := range columns {
@@ -1043,6 +1074,97 @@ func previewRow(item any, columns []string) []string {
 		row = append(row, previewValue(object[column]))
 	}
 	return row
+}
+
+func flattenPreviewItem(item any) map[string]string {
+	object, ok := item.(map[string]any)
+	if !ok {
+		return nil
+	}
+	tagFamilies, tagFamiliesOK := object["tagFamilies"].([]any)
+	if !tagFamiliesOK || len(tagFamilies) == 0 {
+		return nil
+	}
+	flat := make(map[string]string)
+	for _, topKey := range []string{"elementId", "timestamp", "traceId"} {
+		if value, exists := object[topKey]; exists {
+			flat[topKey] = previewValue(value)
+		}
+	}
+	for _, familyValue := range tagFamilies {
+		family, familyOK := familyValue.(map[string]any)
+		if !familyOK {
+			continue
+		}
+		tags, _ := family["tags"].([]any)
+		for _, tagValue := range tags {
+			tag, tagOK := tagValue.(map[string]any)
+			if !tagOK {
+				continue
+			}
+			tagKey, _ := tag["key"].(string)
+			if tagKey == "" {
+				continue
+			}
+			if _, skip := previewSkipTagKeys[tagKey]; skip {
+				continue
+			}
+			flat[tagKey] = previewTagValue(tag["value"])
+		}
+	}
+	if len(flat) == 0 {
+		return nil
+	}
+	return flat
+}
+
+func orderedPreviewColumns(flat map[string]string) []string {
+	columns := make([]string, 0, len(flat))
+	seen := make(map[string]struct{}, len(flat))
+	for _, column := range preferredPreviewColumns {
+		if _, exists := flat[column]; !exists {
+			continue
+		}
+		columns = append(columns, column)
+		seen[column] = struct{}{}
+	}
+	rest := make([]string, 0, len(flat))
+	for column := range flat {
+		if _, alreadyUsed := seen[column]; alreadyUsed {
+			continue
+		}
+		rest = append(rest, column)
+	}
+	sort.Strings(rest)
+	return append(columns, rest...)
+}
+
+func previewTagValue(value any) string {
+	valueMap, ok := value.(map[string]any)
+	if !ok {
+		return previewValue(value)
+	}
+	if _, hasBinary := valueMap["binaryData"]; hasBinary {
+		return "<binary>"
+	}
+	if stringWrap, stringOK := valueMap["str"].(map[string]any); stringOK {
+		return truncatePreviewValue(fmt.Sprint(stringWrap["value"]))
+	}
+	if intWrap, intOK := valueMap["int"].(map[string]any); intOK {
+		return fmt.Sprint(intWrap["value"])
+	}
+	if strArrayWrap, strArrayOK := valueMap["strArray"].(map[string]any); strArrayOK {
+		arrayValue, arrayOK := strArrayWrap["value"].([]any)
+		if !arrayOK {
+			return previewValue(value)
+		}
+		parts := make([]string, 0, len(arrayValue))
+		for _, element := range arrayValue {
+			parts = append(parts, fmt.Sprint(element))
+		}
+		return truncatePreviewValue(strings.Join(parts, ","))
+	}
+	return previewValue(value)
 }
 
 func previewValue(value any) string {

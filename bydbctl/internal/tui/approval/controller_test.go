@@ -27,7 +27,7 @@ func TestControllerReturnsOnlyTheDecisionForTheExactPendingRequest(t *testing.T)
 	errCh := make(chan error, 1)
 	go func() {
 		decision, requestErr := controller.Request(context.Background(), Request{
-			Query:     "SELECT * FROM MEASURE latency IN production TIME > '-30m' LIMIT 10",
+			Query:     "CREATE MEASURE test_latency IN production",
 			Resource:  "MEASURE/latency",
 			Groups:    []string{"production"},
 			TimeRange: "TIME > '-30m'",
@@ -42,7 +42,7 @@ func TestControllerReturnsOnlyTheDecisionForTheExactPendingRequest(t *testing.T)
 	if request.ID == "" {
 		t.Fatal("expected a request ID")
 	}
-	if request.Query != "SELECT * FROM MEASURE latency IN production TIME > '-30m' LIMIT 10" {
+	if request.Query != "CREATE MEASURE test_latency IN production" {
 		t.Fatalf("unexpected query: %s", request.Query)
 	}
 	if resolveErr := controller.Resolve(request.ID, Decision{Approved: true}); resolveErr != nil {
@@ -64,7 +64,7 @@ func TestControllerCancelsPendingRequestWhenContextEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, requestErr := controller.Request(ctx, Request{Query: "SELECT * FROM PROPERTY service IN default LIMIT 1", Source: SourceManual})
+		_, requestErr := controller.Request(ctx, Request{Query: "CREATE MEASURE test_property IN default", Source: SourceManual})
 		errCh <- requestErr
 	}()
 

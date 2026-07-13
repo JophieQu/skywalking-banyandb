@@ -1,6 +1,6 @@
 # BYDBQL Agent TUI
 
-`bydbctl agent` is a three-page terminal workspace where an ACP agent discovers BanyanDB schemas, proposes typed query plans, and safely runs approved queries.
+`bydbctl agent` is a three-page terminal workspace where an ACP agent holds a multi-turn BanyanDB conversation, discovers schemas, proposes typed query plans, and safely runs approved queries.
 
 The default provider is `codex-acp`. It starts `@agentclientprotocol/codex-acp` through `npx`; a different ACP-compatible stdio command can be selected with `--agent acp --acp-command …`.
 
@@ -35,17 +35,26 @@ Each TUI session creates a private, local MCP bridge. It exposes exactly these t
 - `describe_schema`
 - `propose_query_plan`
 - `validate_bydbql`
+- `probe_bydbql`
 - `execute_bydbql`
 
 The Agent starts with no selected schema. It ranks catalog candidates, inspects at most three detailed schemas, and selects a resource only when its typed metadata supports the request. If the best choices remain ambiguous, it asks one focused clarification question. The Schema page is read-only and cannot pin a resource.
 
 `propose_query_plan` accepts a strict JSON plan and uses typed local metadata to render final BYDBQL. The planner supports projections, comparison/`IN` filters with `AND`/`OR`, indexed ordering, Measure aggregation/grouping, and `SHOW TOP`. It rejects `MATCH`, `HAVING`, `OFFSET`, `STAGES`, `WITH QUERY_TRACE`, joins, and unknown column types rather than guessing. `validate_bydbql` remains for manual editor checks; it cannot publish a provider candidate. The bridge rejects every other tool, shell command, external MCP server, dynamic registration, and download.
 
-The legacy `--mcp-config` option is retained only to produce an explicit error; external MCP injection is not supported. The old `codex-exec` provider is removed. The deterministic `fake` provider is test-only and is not a CLI provider. ACP providers that cannot use the controlled plan tool fail instead of falling back to free-text BYDBQL.
+The legacy `--mcp-config` option is retained only to produce an explicit error; external MCP injection is not supported. The old `codex-exec` provider is removed. The deterministic `fake` provider is test-only and is not a CLI provider. A normal answer or clarification may complete without a candidate, but raw BYDBQL in provider text is rejected; only the controlled plan tool can publish a query candidate.
 
 ## Execution approval
 
-No query runs merely because the agent generated it. `execute_bydbql` and the manual `Ctrl+E` path create an approval card containing the exact BYDBQL statement, resource, groups, time range, and limit.
+Execution policy is configurable in the Query tab with `Ctrl+P`:
+
+| Policy | Behavior |
+| --- | --- |
+| `ask every time` | Agent probes and executes only when you explicitly ask; each probe/execute still requires approval |
+| `auto probe` | Agent may call `probe_bydbql` and auto-probe compiled plans; every execution still requires approval |
+| `trust session` | All agent probes and executes auto-approve for the session; manual `Ctrl+E` also auto-approves |
+
+No execution runs merely because the agent generated a candidate unless the active policy allows it. `execute_bydbql`, `probe_bydbql`, and the manual `Ctrl+E` path can create an approval card containing the exact BYDBQL statement, resource, groups, time range, and limit when policy is `ask every time`.
 
 - `y` approves that exact statement for one request.
 - `n` rejects it.
@@ -60,7 +69,7 @@ The local semantic checks require a `TIME` clause for time-series queries and a 
 | Page | Key | Purpose |
 | --- | --- | --- |
 | Schema | F1 | Review catalog candidates, inspected schemas, typed columns, and the Agent's selected evidence |
-| Query / Agent | F2 | Multi-turn conversation, current BYDBQL version, validation and approval |
+| Query / Agent | F2 | Conversation-first workspace: sent messages appear immediately; the QL editor remains a versioned artifact |
 | Run / Activity | F3 | Structured result preview and live plan/tool/approval/execution activity |
 
 Tab navigation works globally, including while typing in Query inputs:
@@ -75,14 +84,18 @@ On the Query page:
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+A` | Send the overall goal plus the optional next instruction to the ACP agent |
+| `Ctrl+A` | Send the current message to the ACP agent |
 | `Ctrl+V` | Validate the current editor content immediately |
-| `Ctrl+E` | Request one-time execution approval for the current valid content |
+| `Ctrl+E` | Request execution approval for the current valid content |
+| `Ctrl+P` | Cycle execution policy (`ask every time` → `auto probe` → `trust session`) |
+| `Ctrl+R` | Toggle visible agent reasoning stream in Activity / Conversation |
 | `Ctrl+←` / `Ctrl+→` | Select a previous or next BYDBQL candidate version |
 | `Tab` / `Shift+Tab` | Change focus |
 | `Esc` / `Ctrl+C` | Stop active work; quit when idle |
 
-Editing the query creates a manual candidate. The editor performs a short debounced local validation but never invokes the agent or runs a query automatically. Agent and manual candidates are versioned independently; a later agent turn starts from the selected version.
+The Query page places the conversation and multi-line composer on the left. Execution policy and reasoning visibility are compact status values above the visible start/end time controls; the old autonomous-discovery card is intentionally absent. The right side keeps the current BYDBQL candidate, version history, validation, probe summary, and approval state.
+
+Editing the query creates a manual candidate. The editor performs a short debounced local validation but never invokes the agent or runs a query automatically. Agent and manual candidates are versioned independently; a later agent turn starts from the selected version. A conversational answer or clarification can complete without changing the current QL candidate.
 
 ## Results and data sharing
 
@@ -92,7 +105,7 @@ When a user asks a later question, or when a workflow advances to a dependent pl
 
 ## Activity log and persistence
 
-The activity log shows user-visible plans, tool lifecycle states, approval decisions, validation, cancellation, and execution summaries. It never displays model internal reasoning.
+The activity log shows user-visible plans, tool lifecycle states, approval decisions, validation, cancellation, execution summaries, and optional agent reasoning when `Ctrl+R` is enabled. Tool call details include summarized arguments and outputs.
 
 Session logs are stored in `$HOME/.bydbctl/logs` by default (override with `--log-dir`) with owner-only file permissions. They contain audit summaries: user actions, candidate statements, tool/approval summaries, durations, row counts, and errors. Raw result rows and long provider responses stay in memory and are not persisted. Sessions end when the TUI exits; cross-process recovery is not implemented.
 
@@ -100,5 +113,5 @@ Session logs are stored in `$HOME/.bydbctl/logs` by default (override with `--lo
 
 - If ACP cannot start, check the selected ACP command and its local login/runtime prerequisites. `codex-acp` requires `npx` and the Codex ACP package.
 - If schema discovery fails, verify the normal bydbctl address, authentication, TLS, certificate, and server permissions.
-- If no candidate appears, inspect the Activity page. The provider must call `propose_query_plan`; a BYDBQL statement embedded in chat text is intentionally ignored.
+- If no candidate appears, inspect the Activity page. The provider may have answered a question or requested clarification. To publish QL, it must call `propose_query_plan`; a BYDBQL statement embedded in chat text is intentionally ignored.
 - If an approval fails after `y`, review the local revalidation error, update the query, and request approval again.

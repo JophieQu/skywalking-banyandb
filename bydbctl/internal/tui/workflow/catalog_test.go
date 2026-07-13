@@ -18,10 +18,73 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 )
+
+func TestCatalogRankingGoalPrefersTurnHint(t *testing.T) {
+	got := CatalogRankingGoal("top 10 slow payment endpoints", "帮我查询cpu指标")
+	if !strings.Contains(got, "cpu") || !strings.Contains(got, "payment") {
+		t.Fatalf("unexpected ranking goal: %q", got)
+	}
+	if !strings.HasPrefix(got, "帮我查询cpu指标") {
+		t.Fatalf("expected turn hint first, got %q", got)
+	}
+}
+
+func TestRankCatalogCandidatesCPUGoal(t *testing.T) {
+	catalog := []session.CatalogEntry{
+		{Group: "sw_metricsMinute", Type: session.ResourceTypeMeasure, Name: "mq_endpoint_consume_latency_minute"},
+		{Group: "sw_metricsMinute", Type: session.ResourceTypeMeasure, Name: "meter_vm_cpu_average_used_minute"},
+	}
+	ranked := RankCatalogCandidates("帮我查询cpu指标", catalog, 2)
+	if len(ranked) == 0 || ranked[0].Name != "meter_vm_cpu_average_used_minute" {
+		t.Fatalf("expected cpu resource first, got %+v", ranked)
+	}
+}
+
+func TestCollapseCJKSpacing(t *testing.T) {
+	input := "你说 得 对 ， 我 目前 受 限于 工具 的限制"
+	got := collapseCJKSpacing(input)
+	want := "你说得对，我目前受限于工具的限制"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestCollapseACPTextSpacingRepairsIdentifiers(t *testing.T) {
+	input := "你说 得 对 ， 我 目前 受 限于 工具 的限制"
+	got := NormalizeAgentDisplayText(input)
+	if !strings.Contains(got, "你说得对") || strings.Contains(got, "你 说") {
+		t.Fatalf("expected cjk spacing repair, got %q", got)
+	}
+}
+
+func TestFindExplicitResourceMentionMinuteToHour(t *testing.T) {
+	catalog := []session.CatalogEntry{
+		{Group: "sw_metricsHour", Type: session.ResourceTypeMeasure, Name: "meter_instance_host_cpu_used_rate_hour"},
+		{Group: "sw_metricsHour", Type: session.ResourceTypeMeasure, Name: "meter_vm_cpu_average_used_hour"},
+	}
+	got := FindExplicitResourceMention("查询 meter_vm_cpu_average_used_minute 最近30分钟", catalog)
+	if got == nil || got.Name != "meter_vm_cpu_average_used_hour" {
+		t.Fatalf("expected closest cpu hour resource, got %+v", got)
+	}
+}
+
+func TestNormalizePlainAgentTextRepairsEnglishFragments(t *testing.T) {
+	input := "Let me start by discovering the sche mas. The auto -matched resource is meter_v m_c pu_a verage_used_min ute, but you don 't see it."
+	got := normalizePlainAgentText(input)
+	for _, unexpected := range []string{"sche mas", "auto -matched", "auto -", "don 't", "meter_v m_c", "mestart"} {
+		if strings.Contains(got, unexpected) {
+			t.Fatalf("expected %q to be repaired in %q", unexpected, got)
+		}
+	}
+	if !strings.Contains(got, "schemas") || !strings.Contains(got, "don't") {
+		t.Fatalf("expected repaired prose, got %q", got)
+	}
+}
 
 func TestRankCatalogCandidatesPaymentEndpoints(t *testing.T) {
 	catalog := []session.CatalogEntry{

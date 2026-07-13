@@ -68,11 +68,13 @@ func (m Model) footerForTab(width int) string {
 		commands = []string{"f1-f3 [ ] tabs", "↑↓ browse", "enter inspect", "/ type", "ctrl+l refresh", "tab focus", "esc quit"}
 	case tabQuery:
 		commands = []string{
-			"f1-f3 [ ] tabs", "ctrl+a agent", "ctrl+v validate", "ctrl+e request execution", "preview up to 50 rows",
-			"ctrl+←/→ versions", "y/n/e approval", "tab focus", "esc stop/quit",
+			"f1-f3 [ ] tabs", "↑↓ messages", "pgup/pgdn detail", "ctrl+a send", "ctrl+v validate", "ctrl+e execute",
+			"ctrl+p policy", "ctrl+r reasoning", "ctrl+←/→ versions", "y/n/e approval", "tab focus", "esc stop/quit",
 		}
 	default:
-		commands = []string{"f1-f3 [ ] tabs", "↑↓ scroll activity", "pgup/pgdn", "tab focus", "esc quit"}
+		commands = []string{
+			"f1-f3 [ ] tabs", "↑↓ row/activity", "pgup/pgdn detail", "ctrl+o export", "ctrl+j raw json", "tab focus", "esc quit",
+		}
 	}
 	return lipgloss.NewStyle().Width(width).Foreground(mutedColor).Render(strings.Join(commands, "  "))
 }
@@ -103,11 +105,11 @@ func (m Model) focusOrder() []int {
 	case tabSchema:
 		return []int{focusCatalog, focusCatalogFilter}
 	case tabQuery:
-		return []int{focusGoal, focusTurnHint, focusStart, focusEnd, focusQuery}
+		return []int{focusChat, focusMessage, focusStart, focusEnd, focusQuery}
 	case tabRun:
-		return []int{focusActivity}
+		return []int{focusExecution, focusActivity}
 	default:
-		return []int{focusGoal}
+		return []int{focusMessage}
 	}
 }
 

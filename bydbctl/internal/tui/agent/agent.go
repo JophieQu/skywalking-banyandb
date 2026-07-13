@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/prompt"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 )
 
@@ -82,6 +83,7 @@ type RequestPayload struct {
 	QueryHints       QueryHints                `json:"query_hints"`
 	TimeRange        TimeRangePayload          `json:"time_range"`
 	ExecutionSummary *ExecutionSummary         `json:"execution_summary,omitempty"`
+	ProbeSummary     *ProbeSummaryPayload      `json:"probe_summary,omitempty"`
 	ValidationError  *string                   `json:"validation_error,omitempty"`
 	Conversation     []ConversationTurnPayload `json:"conversation,omitempty"`
 	Task             string                    `json:"task"`
@@ -94,11 +96,14 @@ type RequestPayload struct {
 
 // Constraints are hard safety constraints owned by bydbctl.
 type Constraints struct {
+	ExecutionPolicy                    string `json:"execution_policy"`
 	FinalArtifact                      string `json:"final_artifact"`
 	ReadOnly                           bool   `json:"read_only"`
 	MustUseSchema                      bool   `json:"must_use_schema"`
 	UserMustEditOrConfirmBeforeExecute bool   `json:"user_must_edit_or_confirm_before_execute"`
 	MustNotExecuteTools                bool   `json:"must_not_execute_tools"`
+	AgentMayProbeData                  bool   `json:"agent_may_probe_data"`
+	AgentMayExecuteWithoutPrompt       bool   `json:"agent_may_execute_without_prompt"`
 }
 
 // SchemaSummary is the schema subset exposed to an agent.
@@ -159,6 +164,15 @@ type ExecutionSummary struct {
 	Error        string     `json:"error,omitempty"`
 }
 
+// ProbeSummaryPayload is the bounded probe feedback exposed to the agent.
+type ProbeSummaryPayload struct {
+	Rows    int        `json:"rows"`
+	Columns []string   `json:"columns,omitempty"`
+	Preview [][]string `json:"preview,omitempty"`
+	Query   string     `json:"query,omitempty"`
+	Error   string     `json:"error,omitempty"`
+}
+
 // BuildBydbqlPrompt renders the provider prompt for BYDBQL generation.
 func BuildBydbqlPrompt(req TurnRequest) (string, error) {
 	payload, marshalErr := MarshalPayload(req.Payload)
@@ -166,9 +180,10 @@ func BuildBydbqlPrompt(req TurnRequest) (string, error) {
 		return "", marshalErr
 	}
 	return prompt.Build(prompt.Input{
-		TaskPrompt:  req.Prompt,
-		PayloadJSON: payload,
-		Candidate:   req.Payload.Candidate,
+		TaskPrompt:      req.Prompt,
+		PayloadJSON:     payload,
+		Candidate:       req.Payload.Candidate,
+		ExecutionPolicy: req.Payload.Constraints.ExecutionPolicy,
 	}), nil
 }
 
@@ -224,6 +239,7 @@ type Event struct {
 	Origin        EventOrigin
 	ToolName      string
 	InputSummary  string
+	InputDetail   string
 	OutputSummary string
 	Status        EventStatus
 	Err           error
@@ -239,11 +255,11 @@ func (event Event) IsTerminal() bool {
 
 // BuildAgentTurnRequest builds the structured request for one user-facing agent turn.
 func BuildAgentTurnRequest(querySession *session.QuerySession, hints QueryHints, templateHint, turnHint string) RequestPayload {
-	payload := buildRequestPayload(querySession, hints, templateHint)
+	payload := buildRequestPayload(querySession, hints, templateHint, querySession.ExecutionPolicy)
 	payload.TurnHint = strings.TrimSpace(turnHint)
 	payload.Conversation = conversationSummary(querySession.Conversation)
 	if strings.TrimSpace(payload.Candidate) == "" {
-		payload.Task = "draft_query_plan"
+		payload.Task = "continue_conversation"
 	} else {
 		payload.Task = "revise_query_plan"
 	}
@@ -252,12 +268,13 @@ func BuildAgentTurnRequest(querySession *session.QuerySession, hints QueryHints,
 
 // BuildReviseRequest builds the structured request used by the BYDBQL refinement workflow.
 func BuildReviseRequest(querySession *session.QuerySession, hints QueryHints, templateHint string) RequestPayload {
-	payload := buildRequestPayload(querySession, hints, templateHint)
+	payload := buildRequestPayload(querySession, hints, templateHint, querySession.ExecutionPolicy)
 	payload.Task = "revise_query_plan"
 	return payload
 }
 
-func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, templateHint string) RequestPayload {
+func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, templateHint string, executionPolicy approval.ExecutionPolicy) RequestPayload {
+	normalizedPolicy := approval.NormalizeExecutionPolicy(string(executionPolicy))
 	var candidate string
 	if currentCandidate := querySession.CurrentCandidate(); currentCandidate != nil {
 		candidate = currentCandidate.Query
@@ -279,6 +296,18 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 			Error:        providerExecutionError(querySession.ExecutionResult.Error),
 		}
 	}
+	var probeSummary *ProbeSummaryPayload
+	if currentCandidate := querySession.CurrentCandidate(); currentCandidate != nil && currentCandidate.Probe != nil {
+		probe := currentCandidate.Probe
+		probeSummary = &ProbeSummaryPayload{
+			Rows:    probe.Rows,
+			Columns: append([]string(nil), probe.Columns...),
+			Preview: previewForProvider(probe.Preview),
+			Query:   probe.Query,
+			Error:   providerExecutionError(probe.Error),
+		}
+	}
+	readOnlyCandidate := approval.IsReadOnlyBYDBQL(candidate)
 	return RequestPayload{
 		Goal:         querySession.UserGoal,
 		Candidate:    candidate,
@@ -289,11 +318,15 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 			End:   strings.TrimSpace(querySession.TimeRange.End),
 		},
 		Constraints: Constraints{
-			FinalArtifact:                      "structured_query_plan",
-			ReadOnly:                           true,
-			MustUseSchema:                      true,
-			UserMustEditOrConfirmBeforeExecute: true,
-			MustNotExecuteTools:                false,
+			ExecutionPolicy: string(normalizedPolicy),
+			FinalArtifact:   "structured_query_plan",
+			ReadOnly:        true,
+			MustUseSchema:   true,
+			UserMustEditOrConfirmBeforeExecute: candidate != "" && !readOnlyCandidate &&
+				normalizedPolicy != approval.PolicyTrustSession,
+			MustNotExecuteTools:          false,
+			AgentMayProbeData:            true,
+			AgentMayExecuteWithoutPrompt: readOnlyCandidate || normalizedPolicy == approval.PolicyTrustSession,
 		},
 		Schema: SchemaSummary{
 			Columns:            columnSummary(querySession.SchemaSnapshot.Columns),
@@ -308,18 +341,15 @@ func buildRequestPayload(querySession *session.QuerySession, hints QueryHints, t
 			Catalog:            catalogSummary(querySession.SchemaSnapshot.Catalog),
 		},
 		ExecutionSummary: executionSummary,
+		ProbeSummary:     probeSummary,
 		ValidationError:  validationError,
 	}
 }
 
-func providerExecutionError(executionError string) string {
-	if strings.TrimSpace(executionError) == "" {
-		return ""
-	}
-	return "BYDBQL execution failed"
-}
-
-const maxProviderPreviewRows = 50
+const (
+	maxProviderConversationTurns = 6
+	maxProviderPreviewRows       = 50
+)
 
 func previewForProvider(preview [][]string) [][]string {
 	if len(preview) == 0 {
@@ -356,8 +386,13 @@ func conversationSummary(turns []session.ConversationTurn) []ConversationTurnPay
 	if len(turns) == 0 {
 		return nil
 	}
-	summary := make([]ConversationTurnPayload, 0, len(turns))
-	for _, turn := range turns {
+	startTurn := len(turns) - maxProviderConversationTurns
+	if startTurn < 0 {
+		startTurn = 0
+	}
+	recentTurns := turns[startTurn:]
+	summary := make([]ConversationTurnPayload, 0, len(recentTurns))
+	for _, turn := range recentTurns {
 		summary = append(summary, ConversationTurnPayload{
 			Hint:      turn.Hint,
 			Response:  turn.Response,

@@ -44,6 +44,9 @@ func ClassifyIntent(querySession *session.QuerySession) agent.QueryHints {
 		AutoMatched: querySession.AutoMatched,
 	}
 	goal := strings.TrimSpace(querySession.UserGoal)
+	if discoveryGoal := strings.TrimSpace(querySession.DiscoveryGoal); discoveryGoal != "" {
+		goal = discoveryGoal
+	}
 	if topNPattern.MatchString(goal) {
 		hints.PreferShowTop = true
 	}

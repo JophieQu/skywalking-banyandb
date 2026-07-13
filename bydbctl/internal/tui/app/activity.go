@@ -50,11 +50,31 @@ func (m *Model) recordActivity(category, title, detail string) {
 
 func (m *Model) recordAgentActivities(events []agent.Event) {
 	for _, event := range events {
-		if !shouldShowAgentEvent(event) {
+		if !m.shouldRecordAgentActivity(event) {
 			continue
 		}
 		m.recordActivity(activityCategory(event), activityTitle(event), activityDetail(event))
+		if m.querySession != nil && event.Kind == agent.EventKindToolCall && strings.TrimSpace(event.ToolName) != "" {
+			toolDetail := strings.TrimSpace(event.InputDetail)
+			if toolDetail == "" {
+				toolDetail = strings.TrimSpace(event.InputSummary)
+			}
+			m.querySession.AddChatMessage(session.ChatMessage{
+				Role:      session.ChatRoleTool,
+				ToolName:  event.ToolName,
+				Content:   fallback(singleLine(event.InputSummary), event.ToolName),
+				Detail:    toolDetail,
+				CreatedAt: event.StartedAt,
+			})
+		}
 	}
+}
+
+func (m *Model) shouldRecordAgentActivity(event agent.Event) bool {
+	if event.Kind == agent.EventKindMessageDelta {
+		return m.showReasoning
+	}
+	return shouldShowAgentEvent(event)
 }
 
 func activityCategory(event agent.Event) string {
@@ -71,8 +91,8 @@ func activityCategory(event agent.Event) string {
 		return "cancelled"
 	case agent.EventKindPlanUpdate:
 		return "plan"
-	case agent.EventKindFinalResponse:
-		return "agent"
+	case agent.EventKindMessageDelta:
+		return "reasoning"
 	case agent.EventKindError:
 		return "error"
 	case agent.EventKindPermissionRequest:
@@ -100,6 +120,8 @@ func activityTitle(event agent.Event) string {
 			return "plan: " + singleLine(event.Message)
 		}
 		return "plan update"
+	case agent.EventKindMessageDelta:
+		return "reasoning: " + truncateRunes(singleLine(event.Message), 96)
 	case agent.EventKindFinalResponse:
 		if strings.TrimSpace(event.Candidate) != "" {
 			return "agent: BYDBQL candidate"

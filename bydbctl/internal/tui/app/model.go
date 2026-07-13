@@ -46,12 +46,13 @@ const (
 const (
 	focusCatalog = iota
 	focusCatalogFilter
-	focusGoal
-	focusTurnHint
+	focusChat
+	focusMessage
 	focusStart
 	focusEnd
 	focusQuery
 	focusActivity
+	focusExecution
 	focusCount
 )
 
@@ -77,8 +78,7 @@ type Model struct {
 	catalog         catalogBrowser
 	selectedSchema  session.SchemaSnapshot
 	catalogFilter   textinput.Model
-	goal            textarea.Model
-	turnHint        textarea.Model
+	message         textarea.Model
 	query           textarea.Model
 	start           textinput.Model
 	end             textinput.Model
@@ -92,14 +92,25 @@ type Model struct {
 	catalogHeight   int
 	activeTab       appTab
 	activityLog     []activityEntry
-	activityScroll  int
-	activityCursor  int
-	detailScroll    int
-	focus           int
+	activityScroll       int
+	activityCursor       int
+	activityDetailScroll int
+	executionDetailScroll int
+	executionRowCursor    int
+	showExecutionRaw      bool
+	executionExportPath   string
+	detailScroll          int
+	chatScroll       int
+	chatCursor       int
+	chatDetailScroll int
+	focus            int
 	busy            bool
+	showReasoning   bool
+	executionPolicy approval.ExecutionPolicy
 	pendingApproval *approval.Request
 	turnCancel      context.CancelFunc
 	turnEvents      []agent.Event
+	queuedMessage   string
 	liveResponse    string
 	queryRevision   int
 }
@@ -113,15 +124,11 @@ func NewModel(config Config) Model {
 	}
 	catalogFilter := newTextInput("", "filter groups/resources")
 	catalogFilter.Width = 24
-	goal := textarea.New()
-	goal.Placeholder = "Overall question (set once, e.g. top 10 slow endpoints in last 30m)"
-	goal.ShowLineNumbers = false
-	goal.SetHeight(3)
-	goal.SetValue(config.Goal)
-	turnHint := textarea.New()
-	turnHint.Placeholder = "This round: extra hint for agent (Ctrl+A). e.g. use sw_metrics, aggregate by AVG"
-	turnHint.ShowLineNumbers = false
-	turnHint.SetHeight(3)
+	message := textarea.New()
+	message.Placeholder = "Ask about schemas or describe the query you need…"
+	message.ShowLineNumbers = false
+	message.SetHeight(5)
+	message.SetValue(config.Goal)
 	query := textarea.New()
 	query.Placeholder = "BYDBQL candidate"
 	query.ShowLineNumbers = false
@@ -142,28 +149,30 @@ func NewModel(config Config) Model {
 			Approvals:    config.Approvals,
 			ToolBridge:   config.ToolBridge,
 		}),
-		executor:       config.Executor,
-		catalog:        newCatalogBrowser(),
-		catalogFilter:  catalogFilter,
-		goal:           goal,
-		turnHint:       turnHint,
-		query:          query,
-		start:          start,
-		end:            end,
-		provider:       provider,
-		status:         "ready",
-		sessionLog:     sessionLog,
-		logPathDisplay: applog.DisplayPath(sessionLogPath(sessionLog)),
-		width:          defaultWidth,
-		height:         defaultHeight,
-		activeTab:      tabQuery,
+		executor:        config.Executor,
+		catalog:         newCatalogBrowser(),
+		catalogFilter:   catalogFilter,
+		message:         message,
+		query:           query,
+		start:           start,
+		end:             end,
+		provider:        provider,
+		status:          "ready",
+		sessionLog:      sessionLog,
+		logPathDisplay:  applog.DisplayPath(sessionLogPath(sessionLog)),
+		executionPolicy: approval.PolicyAskEveryTime,
+		width:           defaultWidth,
+		height:          defaultHeight,
+		activeTab:       tabQuery,
+		focus:           focusMessage,
 	}
 	if sessionLog != nil {
 		sessionLog.Write("session", fmt.Sprintf("provider=%s addr=workflow", provider))
 	}
-	model.addEvent("ready: browse Schema Browser, set Goal, Ctrl+A")
+	model.addEvent("ready: browse Schema Browser, message agent with Ctrl+A")
 	model.resize(defaultWidth, defaultHeight)
 	model.syncFocus()
+	model.syncExecutionPolicy()
 	return model
 }
 
@@ -193,6 +202,12 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logWriteError("agent", typedMsg.startErr)
 			return m, nil
 		}
+		if typedMsg.querySession != nil {
+			m.querySession = typedMsg.querySession
+			m.syncQuerySession()
+			m.queuedMessage = ""
+		}
+		m.message.SetValue("")
 		m.liveResponse = ""
 		return m, m.nextAgentUpdateCmd(typedMsg.updates)
 	case agentTurnUpdateMsg:
@@ -201,8 +216,10 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			m.turnEvents = append(m.turnEvents, event)
 			m.recordAgentActivities([]agent.Event{event})
 			if event.Kind == agent.EventKindMessageDelta {
-				m.liveResponse += event.Message
-				m.status = "agent is responding"
+				if m.showReasoning {
+					m.liveResponse += event.Message
+					m.status = "agent is reasoning"
+				}
 			} else if summary := summarizeAgentEvent(event); summary != "" {
 				m.addUIEvent(summary)
 			}
@@ -223,7 +240,7 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logWriteError("agent", typedMsg.update.Err)
 			return m, nil
 		}
-		m.turnHint.SetValue("")
+		m.message.SetValue("")
 		m.status = "agent turn complete"
 		m.addUIEvent("agent: turn complete")
 		m.logQuerySession(m.querySession)
@@ -275,7 +292,7 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 		m.addAgentEvents(typedMsg.events)
 		m.recordAgentActivities(typedMsg.events)
 		if typedMsg.clearTurnHint {
-			m.turnHint.SetValue("")
+			m.message.SetValue("")
 		}
 		if m.querySession != nil {
 			if validationHint := formatValidationHint(m.querySession.Validation.Message); validationHint != "" {
@@ -292,8 +309,17 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.logQuerySession(m.querySession)
 			if typedMsg.status == "execution complete" {
+				m.executionDetailScroll = 0
+				m.showExecutionRaw = false
+				m.executionExportPath = ""
+				if len(m.querySession.ExecutionResult.Preview) > 0 {
+					m.executionRowCursor = 0
+				} else {
+					m.executionRowCursor = -1
+				}
 				m.recordExecutionActivity(m.querySession)
 				m.switchTab(tabRun)
+				m.focus = focusExecution
 			}
 		}
 		if typedMsg.err != nil {
@@ -307,8 +333,8 @@ func (m Model) Update(teaMsg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logWrite("workflow", typedMsg.status)
 			m.status = typedMsg.status
 		} else if m.querySession != nil && !m.querySession.Validation.Valid && m.querySession.CurrentCandidate() != nil {
-			m.status = "invalid candidate — add Turn hint and press Ctrl+A"
-			m.addUIEvent("validation: add Turn hint and press Ctrl+A to refine")
+			m.status = "invalid candidate — send another message and press Ctrl+A"
+			m.addUIEvent("validation: send another message and press Ctrl+A to refine")
 		}
 		if typedMsg.switchRunTab {
 			m.switchTab(tabRun)
@@ -360,8 +386,9 @@ type approvalMsg struct {
 }
 
 type agentStartedMsg struct {
-	updates  <-chan workflow.TurnUpdate
-	startErr error
+	querySession *session.QuerySession
+	updates      <-chan workflow.TurnUpdate
+	startErr     error
 }
 
 type agentTurnUpdateMsg struct {
@@ -401,12 +428,17 @@ func (m *Model) syncQuerySession() {
 	if m.querySession == nil {
 		return
 	}
+	if m.querySession.CandidateSuperseded {
+		m.query.SetValue("")
+		return
+	}
 	if currentCandidate := m.querySession.CurrentCandidate(); currentCandidate != nil {
 		m.query.SetValue(currentCandidate.Query)
 	}
 	if strings.TrimSpace(m.querySession.SchemaSnapshot.Name) != "" {
 		m.selectedSchema = m.querySession.SchemaSnapshot
 	}
+	m.syncChatCursor(true)
 }
 
 func formatApprovalRequest(request approval.Request) string {
@@ -531,6 +563,14 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 			m.scrollSchemaDetail(delta, m.schemaDetailHeight())
 			return nil, true
 		}
+		if m.activeTab == tabRun && m.focus == focusExecution {
+			delta := 1
+			if keyMsg.String() == "up" {
+				delta = -1
+			}
+			m.moveExecutionRowCursor(delta)
+			return nil, true
+		}
 		if m.activeTab == tabRun && m.focus == focusActivity {
 			delta := 1
 			if keyMsg.String() == "up" {
@@ -539,14 +579,44 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 			m.moveActivityCursor(delta, 8)
 			return nil, true
 		}
+		if m.activeTab == tabQuery && m.focus == focusChat {
+			delta := 1
+			if keyMsg.String() == "up" {
+				delta = -1
+			}
+			m.moveChatCursor(delta, m.chatListViewportHeight())
+			return nil, true
+		}
 		return nil, false
 	case "pgup", "pgdown":
+		if m.activeTab == tabRun && m.focus == focusExecution {
+			delta := 8
+			if keyMsg.String() == "pgup" {
+				delta = -8
+			}
+			m.scrollExecutionDetail(delta, m.executionDetailViewportHeight())
+			return nil, true
+		}
 		if m.activeTab == tabRun && m.focus == focusActivity {
 			delta := 8
 			if keyMsg.String() == "pgup" {
 				delta = -8
 			}
+			if m.scrollActivityDetail(delta, 8) {
+				return nil, true
+			}
+			if m.scrollExecutionDetail(delta, m.executionDetailViewportHeight()) {
+				return nil, true
+			}
 			m.moveActivityCursor(delta, 8)
+			return nil, true
+		}
+		if m.activeTab == tabQuery && m.focus == focusChat {
+			delta := 8
+			if keyMsg.String() == "pgup" {
+				delta = -8
+			}
+			m.moveChatDetailScroll(delta, chatDetailViewportHeight(m.chatPanelHeight(clamp(m.height-8, 18, 40))))
 			return nil, true
 		}
 		return nil, false
@@ -559,17 +629,21 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		if m.busy {
 			return nil, true
 		}
-		if strings.TrimSpace(m.goal.Value()) == "" {
-			m.addUIEvent("goal required before asking agent")
+		messageValue := strings.TrimSpace(m.message.Value())
+		if messageValue == "" {
+			m.addUIEvent("message required before asking agent")
 			return nil, true
 		}
+		m.syncExecutionPolicy()
+		m.queuedMessage = messageValue
+		m.message.SetValue("")
+		m.syncChatCursor(true)
 		m.busy = true
 		m.status = "asking agent"
-		turnHintValue := strings.TrimSpace(m.turnHint.Value())
-		m.logWrite("action", fmt.Sprintf("ctrl+a agent turn hint=%q", turnHintValue))
+		m.logWrite("action", fmt.Sprintf("ctrl+a agent message=%q", messageValue))
 		turnCtx, cancelTurn := context.WithCancel(context.Background())
 		m.turnCancel = cancelTurn
-		return m.agentCmd(turnCtx, turnHintValue), true
+		return m.agentCmd(turnCtx, messageValue), true
 	case "ctrl+v":
 		if m.busy {
 			return nil, true
@@ -589,8 +663,45 @@ func (m *Model) handleKey(keyMsg tea.KeyMsg) (tea.Cmd, bool) {
 		m.turnCancel = cancelExecute
 		return m.executeCmd(executeCtx), true
 	case "ctrl+p":
-		m.status = "the next agent turn automatically receives up to 50 preview rows"
+		m.executionPolicy = m.executionPolicy.Next()
+		m.syncExecutionPolicy()
+		m.status = "execution policy: " + m.executionPolicy.Label()
+		m.addUIEvent("policy: " + m.executionPolicy.Label())
 		return nil, true
+	case "ctrl+r":
+		m.showReasoning = !m.showReasoning
+		if m.showReasoning {
+			m.status = "agent reasoning stream visible"
+		} else {
+			m.status = "agent reasoning stream hidden"
+		}
+		return nil, true
+	case "ctrl+o":
+		if m.activeTab == tabRun && m.querySession != nil && strings.TrimSpace(m.querySession.ExecutionResult.Response) != "" {
+			exportPath, exportErr := exportExecutionResult(m.querySession.ExecutionResult)
+			if exportErr != nil {
+				m.status = exportErr.Error()
+				m.addUIEvent("export failed: " + exportErr.Error())
+				return nil, true
+			}
+			m.executionExportPath = exportPath
+			m.status = "exported execution response"
+			m.addUIEvent("exported: " + exportPath)
+			return nil, true
+		}
+		return nil, false
+	case "ctrl+j":
+		if m.activeTab == tabRun && m.querySession != nil && m.querySession.ExecutionResult.Summary != "" {
+			m.showExecutionRaw = !m.showExecutionRaw
+			m.executionDetailScroll = 0
+			if m.showExecutionRaw {
+				m.status = "showing raw JSON response"
+			} else {
+				m.status = "hiding raw JSON response"
+			}
+			return nil, true
+		}
+		return nil, false
 	default:
 		return nil, false
 	}
@@ -633,8 +744,7 @@ func (m *Model) cancelActive() {
 }
 
 func (m *Model) syncFocus() tea.Cmd {
-	m.goal.Blur()
-	m.turnHint.Blur()
+	m.message.Blur()
 	m.catalogFilter.Blur()
 	m.start.Blur()
 	m.end.Blur()
@@ -644,10 +754,10 @@ func (m *Model) syncFocus() tea.Cmd {
 		return nil
 	case focusCatalogFilter:
 		return m.catalogFilter.Focus()
-	case focusGoal:
-		return m.goal.Focus()
-	case focusTurnHint:
-		return m.turnHint.Focus()
+	case focusChat:
+		return nil
+	case focusMessage:
+		return m.message.Focus()
 	case focusStart:
 		return m.start.Focus()
 	case focusEnd:
@@ -655,6 +765,8 @@ func (m *Model) syncFocus() tea.Cmd {
 	case focusQuery:
 		return m.query.Focus()
 	case focusActivity:
+		return nil
+	case focusExecution:
 		return nil
 	default:
 		return nil
@@ -675,10 +787,10 @@ func (m *Model) updateFocused(teaMsg tea.Msg) tea.Cmd {
 		if strings.TrimSpace(m.catalogFilter.Value()) != m.catalog.filter {
 			m.catalog.setFilter(m.catalogFilter.Value())
 		}
-	case focusGoal:
-		m.goal, updateCmd = m.goal.Update(teaMsg)
-	case focusTurnHint:
-		m.turnHint, updateCmd = m.turnHint.Update(teaMsg)
+	case focusChat:
+		return nil
+	case focusMessage:
+		m.message, updateCmd = m.message.Update(teaMsg)
 	case focusStart:
 		m.start, updateCmd = m.start.Update(teaMsg)
 	case focusEnd:
@@ -686,6 +798,8 @@ func (m *Model) updateFocused(teaMsg tea.Msg) tea.Cmd {
 	case focusQuery:
 		m.query, updateCmd = m.query.Update(teaMsg)
 	case focusActivity:
+		return nil
+	case focusExecution:
 		return nil
 	}
 	if m.focus == focusQuery && previousQuery != m.query.Value() {
@@ -700,24 +814,37 @@ func (m *Model) resize(width, height int) {
 	m.height = height
 	contentWidth := clamp(width-4, 48, 200)
 	catalogWidth := clamp(contentWidth*28/100, 28, 44)
-	rightWidth := contentWidth - catalogWidth - 4
-	middleWidth := maxInt(24, rightWidth*46/100)
-	queryWidth := maxInt(24, rightWidth-middleWidth-2)
-	inputWidth := maxInt(18, middleWidth-18)
+	queryLeftWidth, queryRightWidth := queryTabWidths(contentWidth)
+	timeInputWidth := maxInt(10, (queryLeftWidth-24)/2)
 	m.catalogHeight = clamp(height-6, 20, 40)
 	m.catalogFilter.Width = maxInt(12, catalogWidth-8)
-	m.goal.SetWidth(maxInt(18, middleWidth-4))
-	m.turnHint.SetWidth(maxInt(18, middleWidth-4))
-	m.query.SetWidth(maxInt(18, queryWidth-4))
-	m.start.Width = inputWidth
-	m.end.Width = inputWidth
-	queryHeight := clamp(height-18, 10, 22)
+	m.message.SetWidth(maxInt(18, queryLeftWidth-4))
+	m.query.SetWidth(maxInt(18, queryRightWidth-4))
+	m.start.Width = timeInputWidth
+	m.end.Width = timeInputWidth
+	if contentWidth < 100 {
+		m.query.SetWidth(maxInt(18, contentWidth-4))
+	}
+	queryHeight := clamp(height-18, 8, 16)
 	m.query.SetHeight(queryHeight)
-	m.goal.SetHeight(3)
-	m.turnHint.SetHeight(2)
+	m.message.SetHeight(clamp(height/12, 3, 5))
 }
 
-func (m Model) agentCmd(ctx context.Context, turnHintValue string) tea.Cmd {
+func (m Model) chatPanelHeight(totalHeight int) int {
+	return clamp(totalHeight-8, 16, totalHeight-6)
+}
+
+func (m Model) chatListViewportHeight() int {
+	panelHeight := m.chatPanelHeight(clamp(m.height-8, 18, 40))
+	detailBudget := 0
+	if entries := chatEntries(m.querySession, m.showReasoning, m.liveResponse, m.queuedMessage); m.chatCursor >= 0 &&
+		m.chatCursor < len(entries) && strings.TrimSpace(entries[m.chatCursor].detail) != "" {
+		detailBudget = chatDetailViewportHeight(panelHeight) + 2
+	}
+	return maxInt(panelHeight-8-detailBudget, 4)
+}
+
+func (m Model) agentCmd(ctx context.Context, messageValue string) tea.Cmd {
 	runner := m.runner
 	options := m.startOptions()
 	query := m.query.Value()
@@ -727,8 +854,8 @@ func (m Model) agentCmd(ctx context.Context, turnHintValue string) tea.Cmd {
 		if ensureErr != nil {
 			return agentStartedMsg{startErr: ensureErr}
 		}
-		updates, startErr := runner.StartAgentTurn(ctx, updatedSession, turnHintValue)
-		return agentStartedMsg{updates: updates, startErr: startErr}
+		updates, startErr := runner.StartAgentTurn(ctx, updatedSession, messageValue)
+		return agentStartedMsg{querySession: updatedSession, updates: updates, startErr: startErr}
 	}
 }
 
@@ -783,13 +910,31 @@ func (m Model) executeCmd(ctx context.Context) tea.Cmd {
 	}
 }
 
-func (m Model) startOptions() workflow.StartOptions {
+func (m *Model) startOptions() workflow.StartOptions {
 	return workflow.StartOptions{
 		TimeRange: session.TimeRange{
 			Start: m.start.Value(),
 			End:   m.end.Value(),
 		},
-		Goal: m.goal.Value(),
+		Goal:            m.currentGoal(),
+		ExecutionPolicy: m.executionPolicy,
+	}
+}
+
+func (m Model) currentGoal() string {
+	if m.querySession != nil && strings.TrimSpace(m.querySession.UserGoal) != "" {
+		return m.querySession.UserGoal
+	}
+	if queuedMessage := strings.TrimSpace(m.queuedMessage); queuedMessage != "" {
+		return queuedMessage
+	}
+	return strings.TrimSpace(m.message.Value())
+}
+
+func (m *Model) syncExecutionPolicy() {
+	m.runner.SetExecutionPolicy(m.executionPolicy)
+	if m.querySession != nil {
+		m.querySession.ExecutionPolicy = m.executionPolicy
 	}
 }
 
@@ -829,6 +974,82 @@ func (m Model) catalogListHeight() int {
 	return clamp(m.catalogHeight-16, 8, 22)
 }
 
+func (m *Model) scrollActivityDetail(delta, viewportHeight int) bool {
+	if m.activityCursor < 0 || m.activityCursor >= len(m.activityLog) {
+		return false
+	}
+	selected := m.activityLog[m.activityCursor]
+	if strings.TrimSpace(selected.detail) == "" {
+		return false
+	}
+	detailLines := formatActivityDetailText(selected.detail, clamp(m.width-8, 48, 200))
+	maxScroll := maxInt(len(detailLines)-viewportHeight, 0)
+	if maxScroll == 0 {
+		return false
+	}
+	m.activityDetailScroll += delta
+	if m.activityDetailScroll < 0 {
+		m.activityDetailScroll = 0
+	}
+	if m.activityDetailScroll > maxScroll {
+		m.activityDetailScroll = maxScroll
+	}
+	return true
+}
+
+func (m Model) executionDetailViewportHeight() int {
+	return minInt(maxInt(m.height/2, 10), 22)
+}
+
+func (m *Model) scrollExecutionDetail(delta, viewportHeight int) bool {
+	if m.querySession == nil || m.querySession.ExecutionResult.Summary == "" {
+		return false
+	}
+	bodyLines := m.executionBodyLines(clamp(m.width-8, 48, 200))
+	maxScroll := maxInt(len(bodyLines)-viewportHeight, 0)
+	if maxScroll == 0 {
+		return false
+	}
+	m.executionDetailScroll += delta
+	if m.executionDetailScroll < 0 {
+		m.executionDetailScroll = 0
+	}
+	if m.executionDetailScroll > maxScroll {
+		m.executionDetailScroll = maxScroll
+	}
+	return true
+}
+
+func (m *Model) moveExecutionRowCursor(delta int) {
+	if m.querySession == nil || len(m.querySession.ExecutionResult.Preview) == 0 {
+		m.executionRowCursor = -1
+		return
+	}
+	if m.executionRowCursor < 0 {
+		m.executionRowCursor = 0
+	}
+	m.executionRowCursor += delta
+	if m.executionRowCursor < 0 {
+		m.executionRowCursor = 0
+	}
+	previewLength := len(m.querySession.ExecutionResult.Preview)
+	if m.executionRowCursor >= previewLength {
+		m.executionRowCursor = previewLength - 1
+	}
+	m.executionDetailScroll = 0
+}
+
+func (m Model) executionBodyLines(width int) []string {
+	if m.querySession == nil {
+		return nil
+	}
+	return executionDetailLines(m.querySession.ExecutionResult, executionDisplayOptions{
+		width:       width,
+		selectedRow: m.executionRowCursor,
+		showRaw:     m.showExecutionRaw,
+	})
+}
+
 func (m Model) schemaDetailHeight() int {
 	return clamp(m.height-14, 10, 28)
 }
@@ -851,6 +1072,69 @@ func (m *Model) moveActivityCursor(delta, viewportHeight int) {
 	}
 	if m.activityCursor >= m.activityScroll+viewportHeight {
 		m.activityScroll = m.activityCursor - viewportHeight + 1
+	}
+	m.activityDetailScroll = 0
+}
+
+func (m *Model) syncChatCursor(scrollToEnd bool) {
+	entryCount := chatEntryCount(m.querySession, m.showReasoning, m.liveResponse, m.queuedMessage)
+	if entryCount == 0 {
+		m.chatCursor = 0
+		m.chatScroll = 0
+		return
+	}
+	if scrollToEnd {
+		m.chatCursor = entryCount - 1
+	}
+	m.chatDetailScroll = 0
+	if m.chatCursor < 0 {
+		m.chatCursor = 0
+	}
+	if m.chatCursor >= entryCount {
+		m.chatCursor = entryCount - 1
+	}
+}
+
+func (m *Model) moveChatCursor(delta, viewportHeight int) {
+	entryCount := chatEntryCount(m.querySession, m.showReasoning, m.liveResponse, m.queuedMessage)
+	if entryCount == 0 {
+		m.chatCursor = 0
+		m.chatScroll = 0
+		return
+	}
+	m.chatCursor += delta
+	if m.chatCursor < 0 {
+		m.chatCursor = 0
+	}
+	if m.chatCursor >= entryCount {
+		m.chatCursor = entryCount - 1
+	}
+	if m.chatCursor < m.chatScroll {
+		m.chatScroll = m.chatCursor
+	}
+	if m.chatCursor >= m.chatScroll+viewportHeight {
+		m.chatScroll = m.chatCursor - viewportHeight + 1
+	}
+	m.chatDetailScroll = 0
+}
+
+func (m *Model) moveChatDetailScroll(delta, viewportHeight int) {
+	entries := chatEntries(m.querySession, m.showReasoning, m.liveResponse, m.queuedMessage)
+	if m.chatCursor < 0 || m.chatCursor >= len(entries) {
+		return
+	}
+	detailLines := formatChatDetailLines(entries[m.chatCursor].detail, maxInt(m.width/2, 40))
+	if len(detailLines) == 0 {
+		m.chatDetailScroll = 0
+		return
+	}
+	m.chatDetailScroll += delta
+	maxScroll := maxInt(len(detailLines)-viewportHeight, 0)
+	if m.chatDetailScroll < 0 {
+		m.chatDetailScroll = 0
+	}
+	if m.chatDetailScroll > maxScroll {
+		m.chatDetailScroll = maxScroll
 	}
 }
 

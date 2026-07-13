@@ -168,6 +168,12 @@ func scoreCatalogEntry(goal string, goalTokens []string, entry session.CatalogEn
 	if strings.Contains(entryName, "endpoint") && (strings.Contains(normalizedGoal, "endpoint") || strings.Contains(normalizedGoal, "payment")) {
 		score += 8
 	}
+	if strings.Contains(entryName, "cpu") && strings.Contains(normalizedGoal, "cpu") {
+		score += 12
+	}
+	if strings.Contains(entryName, "cpu") && strings.Contains(normalizedGoal, "处理器") {
+		score += 12
+	}
 	return score
 }
 
@@ -198,6 +204,106 @@ func typeKeywordScore(goal string, resourceType session.ResourceType) int {
 }
 
 const maxPromptCatalogCandidates = 10
+
+// CatalogRankingGoal returns the text used to rank catalog entries for the current turn.
+func CatalogRankingGoal(userGoal, turnHint string) string {
+	turnHint = strings.TrimSpace(turnHint)
+	userGoal = strings.TrimSpace(userGoal)
+	if turnHint == "" {
+		return userGoal
+	}
+	if userGoal == "" {
+		return turnHint
+	}
+	return turnHint + " " + userGoal
+}
+
+var resourceMentionPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9_]{5,}`)
+
+// FindExplicitResourceMention matches a catalog entry named directly in the user text.
+func FindExplicitResourceMention(goal string, entries []session.CatalogEntry) *session.CatalogEntry {
+	repairedGoal := strings.ToLower(RepairFragmentedQuery(goal))
+	compactGoal := strings.ReplaceAll(repairedGoal, " ", "")
+	mentions := resourceMentionPattern.FindAllString(repairedGoal, -1)
+	mentions = append(mentions, resourceMentionPattern.FindAllString(compactGoal, -1)...)
+	var bestEntry *session.CatalogEntry
+	bestScore := 0
+	for _, mention := range mentions {
+		mention = strings.ToLower(strings.TrimSpace(mention))
+		if len(mention) < 8 || isGenericResourceMention(mention) {
+			continue
+		}
+		mentionCompact := strings.ReplaceAll(mention, "_", "")
+		for entryIdx := range entries {
+			entry := &entries[entryIdx]
+			entryName := strings.ToLower(entry.Name)
+			entryCompact := strings.ReplaceAll(entryName, "_", "")
+			score := scoreExplicitResourceMention(mention, mentionCompact, entryName, entryCompact)
+			if score > bestScore {
+				bestScore = score
+				bestEntry = entry
+			}
+		}
+	}
+	if bestScore < 20 {
+		return nil
+	}
+	return bestEntry
+}
+
+func isGenericResourceMention(mention string) bool {
+	switch mention {
+	case "minute", "minutes", "metrics", "metric", "schema", "schemas", "groups", "group", "query", "queries":
+		return true
+	default:
+		return false
+	}
+}
+
+func scoreExplicitResourceMention(mention, mentionCompact, entryName, entryCompact string) int {
+	mentionCore := normalizeResourceGranularity(mention)
+	entryCore := normalizeResourceGranularity(entryName)
+	if mention == entryName {
+		return 120 + len(entryName)
+	}
+	if mentionCore == entryCore {
+		return 110 + len(entryName)
+	}
+	if strings.Contains(mention, entryName) {
+		return 100 + len(entryName)
+	}
+	if strings.Contains(entryCompact, entryCompact) || strings.Contains(entryCompact, mentionCompact) {
+		return 80 + len(entryName)
+	}
+	prefixLen := commonNamePrefixLen(mentionCompact, entryCompact)
+	if prefixLen >= 18 {
+		return 40 + prefixLen
+	}
+	return 0
+}
+
+func normalizeResourceGranularity(name string) string {
+	normalizedName := strings.ToLower(strings.TrimSpace(name))
+	for _, suffix := range []string{"_minute", "_hour", "_day", "_second"} {
+		if strings.HasSuffix(normalizedName, suffix) {
+			return strings.TrimSuffix(normalizedName, suffix)
+		}
+	}
+	return normalizedName
+}
+
+func commonNamePrefixLen(left, right string) int {
+	limit := len(left)
+	if len(right) < limit {
+		limit = len(right)
+	}
+	for idx := 0; idx < limit; idx++ {
+		if left[idx] != right[idx] {
+			return idx
+		}
+	}
+	return limit
+}
 
 // RankCatalogCandidates returns the highest-scoring catalog entries for a goal.
 func RankCatalogCandidates(goal string, entries []session.CatalogEntry, limit int) []session.CatalogEntry {

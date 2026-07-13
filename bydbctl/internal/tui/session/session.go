@@ -21,6 +21,8 @@ package session
 import (
 	"strings"
 	"time"
+
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
 )
 
 // Phase is the deterministic workflow phase owned by bydbctl.
@@ -28,12 +30,14 @@ type Phase string
 
 // Workflow phases.
 const (
-	PhaseIntent     Phase = "intent"
-	PhaseAgentDraft Phase = "agent_draft"
-	PhaseValidate   Phase = "validate"
-	PhaseReady      Phase = "ready"
-	PhaseExecuted   Phase = "executed"
-	PhaseError      Phase = "error"
+	PhaseIntent       Phase = "intent"
+	PhaseAgentDraft   Phase = "agent_draft"
+	PhaseConversation Phase = "conversation"
+	PhaseClarifying   Phase = "clarifying"
+	PhaseValidate     Phase = "validate"
+	PhaseReady        Phase = "ready"
+	PhaseExecuted     Phase = "executed"
+	PhaseError        Phase = "error"
 )
 
 // String returns the phase name.
@@ -169,6 +173,37 @@ type SchemaCatalog struct {
 // CandidateSource records where a BYDBQL candidate came from.
 type CandidateSource string
 
+// ChatRole identifies who authored a chat message.
+type ChatRole string
+
+// Chat roles.
+const (
+	ChatRoleUser      ChatRole = "user"
+	ChatRoleAssistant ChatRole = "assistant"
+	ChatRoleTool      ChatRole = "tool"
+	ChatRoleSystem    ChatRole = "system"
+)
+
+// ChatMessage is one user-visible chat entry in the agent conversation.
+type ChatMessage struct {
+	CreatedAt  time.Time
+	Validation *ValidationReport
+	Role       ChatRole
+	Content    string
+	Detail     string
+	Candidate  string
+	ToolName   string
+}
+
+// ProbeSummary stores a bounded read-only probe execution for a candidate.
+type ProbeSummary struct {
+	Columns []string
+	Preview [][]string
+	Query   string
+	Error   string
+	Rows    int
+}
+
 // Candidate sources.
 const (
 	CandidateSourceAgent  CandidateSource = "agent"
@@ -179,6 +214,7 @@ const (
 type BydbqlCandidate struct {
 	CreatedAt   time.Time
 	Validation  ValidationReport
+	Probe       *ProbeSummary
 	ID          string
 	Query       string
 	Explanation string
@@ -252,6 +288,8 @@ type QuerySession struct {
 	ID                string
 	Phase             Phase
 	UserGoal          string
+	DiscoveryGoal     string
+	CandidateSuperseded bool
 	ResourceType      ResourceType
 	ResourceName      string
 	Groups            []string
@@ -268,6 +306,9 @@ type QuerySession struct {
 	Validation        ValidationReport
 	ExecutionResult   ExecutionResult
 	Transcript        []TranscriptEntry
+	ChatMessages      []ChatMessage
+	ExecutionPolicy   approval.ExecutionPolicy
+	PendingProbe      *ProbeSummary
 }
 
 // CurrentCandidate returns the newest candidate query.
@@ -287,6 +328,7 @@ func (qs *QuerySession) AddCandidate(candidate BydbqlCandidate) {
 	qs.Candidates = append(qs.Candidates, candidate)
 	qs.SelectedCandidate = len(qs.Candidates) - 1
 	qs.Validation = candidate.Validation
+	qs.CandidateSuperseded = false
 }
 
 // SetPlannedQueries replaces the active agent workflow with compiled, exact statements.
@@ -341,6 +383,34 @@ func (qs *QuerySession) AddConversationTurn(turn ConversationTurn) {
 		return
 	}
 	qs.Conversation = append(qs.Conversation, turn)
+}
+
+// AddChatMessage appends one chat entry to the visible conversation history.
+func (qs *QuerySession) AddChatMessage(message ChatMessage) {
+	if strings.TrimSpace(message.Content) == "" && strings.TrimSpace(message.Candidate) == "" {
+		return
+	}
+	qs.ChatMessages = append(qs.ChatMessages, message)
+}
+
+// SetPendingProbe stores a probe result for the next candidate publication.
+func (qs *QuerySession) SetPendingProbe(probe *ProbeSummary) {
+	if probe == nil {
+		qs.PendingProbe = nil
+		return
+	}
+	copiedProbe := *probe
+	qs.PendingProbe = &copiedProbe
+}
+
+// TakePendingProbe returns and clears the probe result waiting for candidate publication.
+func (qs *QuerySession) TakePendingProbe() *ProbeSummary {
+	if qs == nil || qs.PendingProbe == nil {
+		return nil
+	}
+	probe := qs.PendingProbe
+	qs.PendingProbe = nil
+	return probe
 }
 
 // AddTranscript appends a visible workflow or agent event.

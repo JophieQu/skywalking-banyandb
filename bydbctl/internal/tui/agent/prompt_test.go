@@ -18,6 +18,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -46,12 +47,13 @@ func TestBuildBydbqlPromptIncludesOutputContract(t *testing.T) {
 		t.Fatalf("BuildBydbqlPrompt returned error: %v", promptErr)
 	}
 	for _, expected := range []string{
-		"query-planning specialist",
+		"query workspace assistant",
 		"propose_query_plan",
-		"Never write, validate, or publish a raw BYDBQL statement",
+		"Never publish a raw BYDBQL statement in free text",
 		"Context JSON:",
 		"top slow endpoints",
-		"Use only the five provided bydbctl tools",
+		"Use only the provided bydbctl tools",
+		"probe_bydbql",
 		"time_range",
 	} {
 		if !strings.Contains(prompt, expected) {
@@ -87,10 +89,58 @@ func TestBuildAgentTurnRequestRedactsTransportErrors(t *testing.T) {
 		},
 	}
 	payload := BuildAgentTurnRequest(querySession, QueryHints{}, "", "")
-	if payload.ExecutionSummary == nil || payload.ExecutionSummary.Error != "BYDBQL execution failed" {
+	if payload.ExecutionSummary == nil || payload.ExecutionSummary.Error != "BYDBQL execution failed: transport error" {
 		t.Fatalf("unexpected execution error summary: %+v", payload.ExecutionSummary)
 	}
 	if strings.Contains(payload.ExecutionSummary.Error, "banyandb.internal") {
 		t.Fatalf("transport details leaked to provider: %+v", payload.ExecutionSummary)
+	}
+}
+
+func TestBuildAgentTurnRequestKeepsRecentConversationWindow(t *testing.T) {
+	querySession := &session.QuerySession{}
+	for turnIdx := 0; turnIdx < 8; turnIdx++ {
+		querySession.AddConversationTurn(session.ConversationTurn{
+			Hint:      fmt.Sprintf("request-%d", turnIdx),
+			Response:  fmt.Sprintf("response-%d", turnIdx),
+			Candidate: fmt.Sprintf("candidate-%d", turnIdx),
+		})
+	}
+	payload := BuildAgentTurnRequest(querySession, QueryHints{}, "", "follow up")
+	if len(payload.Conversation) != 6 {
+		t.Fatalf("expected six recent turns, got %+v", payload.Conversation)
+	}
+	if payload.Conversation[0].Hint != "request-2" {
+		t.Fatalf("expected oldest retained turn, got %+v", payload.Conversation[0])
+	}
+	if payload.Conversation[5].Hint != "request-7" {
+		t.Fatalf("expected latest retained turn, got %+v", payload.Conversation[5])
+	}
+}
+
+func TestBuildBydbqlPromptAllowsConversationBeforeAPlan(t *testing.T) {
+	prompt, promptErr := BuildBydbqlPrompt(TurnRequest{
+		Prompt: "Continue the conversation.",
+		Payload: RequestPayload{
+			Task: "continue_conversation",
+			Goal: "Which groups contain payment metrics?",
+			Schema: SchemaSummary{
+				AvailableGroups: []string{"production", "staging"},
+			},
+		},
+	})
+	if promptErr != nil {
+		t.Fatalf("BuildBydbqlPrompt returned error: %v", promptErr)
+	}
+	for _, expected := range []string{
+		"A normal conversational response is valid when no query is ready.",
+		"Submit a typed query plan only when the user asks for a query and the request is specific enough.",
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("prompt does not contain %q:\n%s", expected, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Do not end the turn until propose_query_plan returns valid=true") {
+		t.Fatalf("conversation prompt still requires a plan:\n%s", prompt)
 	}
 }

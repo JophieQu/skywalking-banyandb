@@ -243,6 +243,15 @@ func toolDefinitions() []map[string]any {
 			},
 		},
 		{
+			"name":        ToolProbeBydbQL,
+			"description": "Run a bounded read-only probe against the current compiled query plan to verify it returns data.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"required":   []string{"query"},
+				"properties": map[string]any{"query": map[string]string{"type": "string"}},
+			},
+		},
+		{
 			"name":        ToolExecuteBydbQL,
 			"description": "Request one-time user approval and execute exactly one validated BYDBQL statement.",
 			"inputSchema": map[string]any{

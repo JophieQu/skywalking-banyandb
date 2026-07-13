@@ -14,7 +14,11 @@
 
 package app
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
+)
 
 func TestStartOptionsDoNotExposeManualSchemaSlots(t *testing.T) {
 	model := NewModel(Config{Goal: "show slow endpoints"})
@@ -24,5 +28,12 @@ func TestStartOptionsDoNotExposeManualSchemaSlots(t *testing.T) {
 	}
 	if options.NameProvided || options.GroupsProvided || options.TypeProvided {
 		t.Fatalf("manual schema pins must be disabled: %+v", options)
+	}
+}
+
+func TestNewModelDefaultsToAskEveryTime(t *testing.T) {
+	model := NewModel(Config{})
+	if model.executionPolicy != approval.PolicyAskEveryTime {
+		t.Fatalf("unexpected default execution policy: %s", model.executionPolicy)
 	}
 }

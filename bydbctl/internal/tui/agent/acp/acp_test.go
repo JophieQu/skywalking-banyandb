@@ -98,7 +98,7 @@ func TestNormalizeEventMapsPermissionRequest(t *testing.T) {
 }
 
 func TestPermissionDecisionAllowsOnlyControlledTools(t *testing.T) {
-	for _, toolName := range []string{"validate_bydbql", "propose_query_plan"} {
+	for _, toolName := range []string{"validate_bydbql", "propose_query_plan", "probe_bydbql"} {
 		decision := permissionDecision(map[string]any{
 			"toolCall": map[string]any{"name": toolName},
 			"options": []any{

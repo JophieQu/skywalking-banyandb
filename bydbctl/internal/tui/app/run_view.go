@@ -27,53 +27,65 @@ import (
 )
 
 func (m Model) renderRunTab(width, height int) string {
-	executionPanel := m.renderExecutionDetail(width)
-	activityHeight := clamp(height-lipgloss.Height(executionPanel)-6, 8, 30)
+	executionHeight := minInt(maxInt(height/2, 10), 22)
+	executionPanel := m.renderExecutionDetail(width, executionHeight)
+	activityHeight := clamp(height-lipgloss.Height(executionPanel)-4, 6, 30)
 	activityPanel := m.renderActivityLog(width, activityHeight)
 	return lipgloss.JoinVertical(lipgloss.Left, executionPanel, activityPanel)
 }
 
-func (m Model) renderExecutionDetail(width int) string {
-	rows := []string{titleStyle.Render("Execution")}
+func (m Model) renderExecutionDetail(width, viewportHeight int) string {
+	title := "Execution"
+	if m.focus == focusExecution {
+		title = "Execution · focused"
+	}
+	rows := []string{titleStyle.Render(title)}
 	if m.querySession == nil || m.querySession.ExecutionResult.Summary == "" {
 		rows = append(rows, mutedStyle.Render("Press Ctrl+E on the Query tab to execute the current BYDBQL candidate."))
 		return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
 	}
-	executionResult := m.querySession.ExecutionResult
 	phase := session.PhaseIntent
 	if m.querySession != nil {
 		phase = m.querySession.Phase
 	}
-	rows = append(rows,
-		fmt.Sprintf("Phase: %s", phase),
-		"Resource type: "+fallback(executionResult.ResourceType, "-"),
-		"Duration: "+executionResult.Duration.String(),
-		"Command: "+fallback(executionResult.Command, "-"),
-		"Path: "+fallback(executionResult.Path, "-"),
-		fmt.Sprintf("Rows: %d", executionResult.Rows),
-		"Summary: "+executionResult.Summary,
-	)
-	if executionResult.Error != "" {
-		rows = append(rows, badStyle.Render("Error: "+executionResult.Error))
+	rows = append(rows, fmt.Sprintf("Phase: %s", phase))
+	if m.executionExportPath != "" {
+		rows = append(rows, mutedStyle.Render("Exported: "+m.executionExportPath))
 	}
-	if executionResult.Hint != "" {
-		rows = append(rows, warnStyle.Render("Hint: "+executionResult.Hint))
+	bodyLines := m.executionBodyLines(width - 4)
+	visibleHeight := maxInt(viewportHeight-lipgloss.Height(strings.Join(rows, "\n"))-2, 6)
+	if len(bodyLines) > visibleHeight {
+		rows = append(rows, mutedStyle.Render(fmt.Sprintf(
+			"Detail · pgup/pgdn scroll · %d/%d lines",
+			minInt(m.executionDetailScroll+visibleHeight, len(bodyLines)),
+			len(bodyLines),
+		)))
 	}
-	if len(executionResult.Columns) > 0 {
-		rows = append(rows, titleStyle.Render("Table preview"))
-		rows = append(rows, strings.Join(executionResult.Columns, " | "))
-		for _, previewRow := range executionResult.Preview {
-			rows = append(rows, truncate(strings.Join(previewRow, " | "), width-4))
-		}
-		if executionResult.Truncated {
-			rows = append(rows, warnStyle.Render("preview truncated; open raw response below only when needed"))
-		}
-	}
-	if executionResult.Response != "" {
-		rows = append(rows, titleStyle.Render("Raw response (current process only)"))
-		rows = append(rows, mutedStyle.Render(wrapText(executionResult.Response, width-4)))
+	startIdx := m.executionDetailScroll
+	endIdx := minInt(startIdx+visibleHeight, len(bodyLines))
+	for lineIdx := startIdx; lineIdx < endIdx; lineIdx++ {
+		rows = append(rows, renderExecutionLine(bodyLines[lineIdx]))
 	}
 	return panelStyle.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+}
+
+func renderExecutionLine(line string) string {
+	switch {
+	case strings.HasPrefix(line, "Error: "):
+		return badStyle.Render(line)
+	case strings.HasPrefix(line, "Hint: "):
+		return warnStyle.Render(line)
+	case strings.HasPrefix(line, "Full JSON hidden"), strings.HasPrefix(line, "Full JSON response omitted"), strings.HasPrefix(line, "…"):
+		return mutedStyle.Render(line)
+	case strings.HasPrefix(line, "Table preview"):
+		return titleStyle.Render(line)
+	case strings.HasPrefix(line, "Row detail"):
+		return titleStyle.Render(line)
+	case line == "Response preview":
+		return titleStyle.Render(line)
+	default:
+		return line
+	}
 }
 
 func (m Model) renderActivityLog(width, height int) string {
@@ -121,8 +133,17 @@ func (m Model) renderActivityLog(width, height int) string {
 	if m.activityCursor >= 0 && m.activityCursor < len(m.activityLog) {
 		selected := m.activityLog[m.activityCursor]
 		if selected.detail != "" {
-			rows = append(rows, titleStyle.Render("Detail"))
-			rows = append(rows, mutedStyle.Render(wrapText(selected.detail, width-4)))
+			detailLines := formatActivityDetailText(selected.detail, width-4)
+			detailViewport := maxInt(height-lipgloss.Height(strings.Join(rows, "\n"))-2, 4)
+			if len(detailLines) > detailViewport {
+				rows = append(rows, titleStyle.Render("Detail · pgup/pgdn scroll"))
+			} else {
+				rows = append(rows, titleStyle.Render("Detail"))
+			}
+			detailEnd := minInt(m.activityDetailScroll+detailViewport, len(detailLines))
+			for lineIdx := m.activityDetailScroll; lineIdx < detailEnd; lineIdx++ {
+				rows = append(rows, mutedStyle.Render(detailLines[lineIdx]))
+			}
 		}
 	}
 	rows = append(rows, mutedStyle.Render(fmt.Sprintf("%d/%d entries", endIdx, len(m.activityLog))))

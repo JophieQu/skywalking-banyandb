@@ -40,8 +40,9 @@ type Source string
 
 // Approval request sources.
 const (
-	SourceAgentTool Source = "agent_tool"
-	SourceManual    Source = "manual"
+	SourceAgentTool   Source = "agent_tool"
+	SourceAgentProbe  Source = "agent_probe"
+	SourceManual      Source = "manual"
 )
 
 // Request describes the exact statement that needs a user decision.
@@ -90,6 +91,7 @@ type Controller struct {
 
 	mu      sync.Mutex
 	pending map[string]chan Decision
+	policy  ExecutionPolicy
 }
 
 // NewController creates an approval controller.
@@ -98,7 +100,28 @@ func NewController() *Controller {
 		now:      time.Now,
 		requests: make(chan Request, requestBufferSize),
 		pending:  make(map[string]chan Decision),
+		policy:   PolicyAskEveryTime,
 	}
+}
+
+// SetPolicy stores the active execution policy for this TUI session.
+func (controller *Controller) SetPolicy(policy ExecutionPolicy) {
+	if controller == nil {
+		return
+	}
+	controller.mu.Lock()
+	controller.policy = NormalizeExecutionPolicy(string(policy))
+	controller.mu.Unlock()
+}
+
+// Policy returns the active execution policy.
+func (controller *Controller) Policy() ExecutionPolicy {
+	if controller == nil {
+		return PolicyAskEveryTime
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.policy
 }
 
 // Requests returns newly pending execution requests.
@@ -118,6 +141,9 @@ func (controller *Controller) Request(ctx context.Context, request Request) (Dec
 	request.ID = uuid.NewString()
 	request.CreatedAt = controller.now()
 	request.Groups = append([]string(nil), request.Groups...)
+	if controller.Policy().AutoApprove(request.Source, request.Source == SourceAgentProbe, request.Query) {
+		return Decision{Approved: true}, nil
+	}
 	decisionCh := make(chan Decision, 1)
 	controller.mu.Lock()
 	controller.pending[request.ID] = decisionCh

@@ -389,3 +389,60 @@ func containsPath(paths []string, expected string) bool {
 	}
 	return false
 }
+
+func TestResponsePreviewFlattensStreamTagFamilies(t *testing.T) {
+	body := []byte(`{
+		"streamResult": {
+			"elements": [
+				{
+					"elementId": "ace4e1e4b2ec08a0",
+					"timestamp": "2026-07-12T14:12:39.279Z",
+					"tagFamilies": [
+						{
+							"name": "searchable",
+							"tags": [
+								{"key": "trace_id", "value": {"str": {"value": "f3f3ae1f-c973-4ce9-84cd-03cec7ddb903"}}},
+								{"key": "content", "value": {"str": {"value": "Listing top songs"}}},
+								{"key": "tags_raw_data", "value": {"binaryData": "AAAA"}}
+							]
+						}
+					]
+				}
+			]
+		}
+	}`)
+	columns, preview, truncated := responsePreview(body, 10)
+	if truncated {
+		t.Fatal("expected single-row preview without truncation")
+	}
+	if len(preview) != 1 {
+		t.Fatalf("expected one preview row, got %v", preview)
+	}
+	if !containsString(columns, "trace_id") || !containsString(columns, "content") {
+		t.Fatalf("unexpected columns: %v", columns)
+	}
+	row := map[string]string{}
+	for idx, column := range columns {
+		if idx < len(preview[0]) {
+			row[column] = preview[0][idx]
+		}
+	}
+	if row["trace_id"] != "f3f3ae1f-c973-4ce9-84cd-03cec7ddb903" {
+		t.Fatalf("unexpected trace_id: %q", row["trace_id"])
+	}
+	if !strings.Contains(row["content"], "Listing top songs") {
+		t.Fatalf("unexpected content: %q", row["content"])
+	}
+	if containsString(columns, "tags_raw_data") {
+		t.Fatalf("did not expect skipped tag column: %v", columns)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

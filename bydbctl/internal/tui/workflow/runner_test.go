@@ -19,11 +19,14 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/agent/fake"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
+	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 )
@@ -335,6 +338,22 @@ func TestReviseWithAgentRejectsCandidateEmbeddedInFragmentedACPOutput(t *testing
 	}
 }
 
+func TestNormalizeAgentDisplayTextPreservesNaturalLanguage(t *testing.T) {
+	input := "I need more information before writing a query."
+	got := NormalizeAgentDisplayText(input)
+	if got != input {
+		t.Fatalf("got %q want %q", got, input)
+	}
+}
+
+func TestNormalizeAgentDisplayTextRepairsACPFragments(t *testing.T) {
+	input := "The top candidate is ` end point _m q _ cons ume _l atency _h our ` in ` sw _ metrics Hour `"
+	got := NormalizeAgentDisplayText(input)
+	if strings.Contains(got, "topcandidate") || strings.Contains(got, "end point") {
+		t.Fatalf("expected natural language and identifier fragments to be repaired, got %q", got)
+	}
+}
+
 func TestNormalizeFragmentedAgentTextTimeRange(t *testing.T) {
 	input := "TIME > '- 30 m '"
 	got := normalizeFragmentedAgentText(input)
@@ -448,7 +467,7 @@ func TestReviseWithAgentRejectsCandidateEmbeddedInJSONMessage(t *testing.T) {
 	}
 }
 
-func TestReviseWithAgentReportsRawOutputWhenNoCandidate(t *testing.T) {
+func TestReviseWithAgentKeepsConversationWithoutCandidate(t *testing.T) {
 	gateway := scriptedGateway{
 		events: []agent.Event{
 			{
@@ -467,12 +486,58 @@ func TestReviseWithAgentReportsRawOutputWhenNoCandidate(t *testing.T) {
 	if startErr != nil {
 		t.Fatalf("StartSession returned error: %v", startErr)
 	}
-	_, reviseErr := runner.ReviseWithAgent(context.Background(), querySession)
-	if reviseErr == nil {
-		t.Fatal("expected ReviseWithAgent to return error")
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
+		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
 	}
-	if !strings.Contains(reviseErr.Error(), "agent output: I need more information") {
-		t.Fatalf("expected raw agent output in error, got: %v", reviseErr)
+	if querySession.Phase != session.PhaseConversation {
+		t.Fatalf("expected conversation phase, got %s", querySession.Phase)
+	}
+	if querySession.CurrentCandidate() != nil {
+		t.Fatalf("unexpected candidate: %+v", querySession.CurrentCandidate())
+	}
+	if len(querySession.Conversation) != 1 || querySession.Conversation[0].Response != "I need more information before writing a query." {
+		t.Fatalf("expected conversation response, got %+v", querySession.Conversation)
+	}
+}
+
+func TestReviseWithAgentAllowsConversationThatMentionsSelect(t *testing.T) {
+	gateway := scriptedGateway{
+		events: []agent.Event{{
+			Kind:    agent.EventKindFinalResponse,
+			Message: "The typed planner can create SELECT queries after you choose a metric.",
+		}},
+	}
+	runner := NewRunner(Config{AgentGateway: gateway})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"production"},
+		Goal:         "what queries can I create?",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	if _, reviseErr := runner.ReviseWithAgent(context.Background(), querySession); reviseErr != nil {
+		t.Fatalf("ReviseWithAgent returned error: %v", reviseErr)
+	}
+	if querySession.Phase != session.PhaseConversation {
+		t.Fatalf("expected conversation phase, got %s", querySession.Phase)
+	}
+}
+
+func TestCompleteAgentTurnDoesNotTreatToolOutputAsConversation(t *testing.T) {
+	runner := NewRunner(Config{})
+	querySession := &session.QuerySession{}
+	completeErr := runner.completeAgentTurn(context.Background(), querySession, "", []agent.Event{{
+		Kind:    agent.EventKindToolResult,
+		Origin:  agent.EventOriginToolBridge,
+		Message: "tool completed",
+	}})
+	if completeErr == nil {
+		t.Fatal("expected tool output without an agent response to be rejected")
+	}
+	if len(querySession.Conversation) != 0 {
+		t.Fatalf("tool output must not become a conversation turn: %+v", querySession.Conversation)
 	}
 }
 
@@ -559,6 +624,81 @@ func TestStartAgentTurnStreamsEventsBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestRunAgentTurnSynchronizesControlledBridgeState(t *testing.T) {
+	schema := session.SchemaSnapshot{
+		Type:   session.ResourceTypeMeasure,
+		Name:   "service_latency",
+		Groups: []string{"production"},
+		Loaded: true,
+		Columns: []session.SchemaColumn{
+			{Name: "latency", Kind: session.SchemaColumnField, Type: session.SchemaValueTypeFloat},
+		},
+	}
+	executor := &catalogExecutor{schema: schema}
+	validator := &sequenceValidator{reports: []session.ValidationReport{
+		{Valid: true, QueryType: "MEASURE"},
+		{Valid: true, QueryType: "MEASURE"},
+	}}
+	toolBridge := bridge.New(bridge.Config{Executor: executor, Validator: validator})
+	runner := NewRunner(Config{
+		AgentGateway: controlledBridgeGateway{toolBridge: toolBridge},
+		Executor:     executor,
+		ToolBridge:   toolBridge,
+		Validator:    validator,
+	})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"production"},
+		Goal:         "show service latency",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	if _, turnErr := runner.RunAgentTurn(context.Background(), querySession, "create the query"); turnErr != nil {
+		t.Fatalf("RunAgentTurn returned error: %v", turnErr)
+	}
+	if len(querySession.PlannedQueries) != 1 || querySession.CurrentPlannedQuery() == nil {
+		t.Fatalf("expected the runner to synchronize the controlled plan: %+v", querySession.PlannedQueries)
+	}
+	if querySession.CurrentCandidate() == nil || querySession.CurrentCandidate().Query != querySession.CurrentPlannedQuery().Query {
+		t.Fatalf("expected the synchronized plan to publish the current candidate: %+v", querySession)
+	}
+}
+
+func TestCancelledAgentTurnDoesNotPublishPartialConversation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gateway := blockingGateway{started: make(chan struct{})}
+	runner := NewRunner(Config{AgentGateway: gateway})
+	querySession, startErr := runner.StartSession(context.Background(), StartOptions{
+		ResourceType: session.ResourceTypeMeasure,
+		ResourceName: "service_latency",
+		Groups:       []string{"production"},
+		Goal:         "show service latency",
+	})
+	if startErr != nil {
+		t.Fatalf("StartSession returned error: %v", startErr)
+	}
+	updates, turnErr := runner.StartAgentTurn(ctx, querySession, "create a query")
+	if turnErr != nil {
+		t.Fatalf("StartAgentTurn returned error: %v", turnErr)
+	}
+	<-gateway.started
+	cancel()
+	for update := range updates {
+		if !update.Done {
+			continue
+		}
+		if !errors.Is(update.Err, context.Canceled) {
+			t.Fatalf("expected cancelled update, got %+v", update)
+		}
+	}
+	if len(querySession.Conversation) != 0 || len(querySession.ChatMessages) != 1 {
+		t.Fatalf("expected only the user message after cancellation, got conversation=%+v chat=%+v", querySession.Conversation, querySession.ChatMessages)
+	}
+}
+
 func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	var requests []agent.TurnRequest
 	gateway := scriptedGateway{
@@ -605,14 +745,69 @@ func TestReviseWithAgentIncludesExecutionSummary(t *testing.T) {
 	if payload.ExecutionSummary.ResourceType != "" || len(payload.ExecutionSummary.Columns) != 0 {
 		t.Fatalf("unexpected data-bearing execution summary: %+v", payload.ExecutionSummary)
 	}
-	if !payload.Constraints.UserMustEditOrConfirmBeforeExecute {
-		t.Fatal("expected execution confirmation constraint")
+	if payload.Constraints.UserMustEditOrConfirmBeforeExecute {
+		t.Fatal("read-only query should not require execution confirmation")
+	}
+	if !payload.Constraints.AgentMayExecuteWithoutPrompt {
+		t.Fatal("read-only query should allow agent execute without prompt")
 	}
 }
 
 type scriptedGateway struct {
 	events   []agent.Event
 	requests *[]agent.TurnRequest
+}
+
+type controlledBridgeGateway struct {
+	toolBridge *bridge.ToolBridge
+}
+
+func (gateway controlledBridgeGateway) Start(_ context.Context, _ agent.StartRequest) (agent.Session, error) {
+	return agent.Session{ID: "controlled-bridge", Provider: "controlled-bridge"}, nil
+}
+
+func (gateway controlledBridgeGateway) Send(_ context.Context, _ string, _ agent.TurnRequest) (<-chan agent.Event, error) {
+	result := gateway.toolBridge.Call(context.Background(), bridge.Call{
+		Name: bridge.ToolProposeQueryPlan,
+		Arguments: map[string]any{"plan": map[string]any{
+			"resource": map[string]any{"type": "MEASURE", "name": "service_latency", "groups": []any{"production"}},
+			"limit":    10,
+		}},
+	})
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	events := make(chan agent.Event, 1)
+	events <- agent.Event{Kind: agent.EventKindFinalResponse, Message: "query plan prepared"}
+	close(events)
+	return events, nil
+}
+
+func (gateway controlledBridgeGateway) Stop(_ context.Context, _ string) error {
+	return nil
+}
+
+type blockingGateway struct {
+	started chan struct{}
+}
+
+func (gateway blockingGateway) Start(_ context.Context, _ agent.StartRequest) (agent.Session, error) {
+	return agent.Session{ID: "blocking", Provider: "blocking"}, nil
+}
+
+func (gateway blockingGateway) Send(ctx context.Context, _ string, _ agent.TurnRequest) (<-chan agent.Event, error) {
+	events := make(chan agent.Event, 1)
+	events <- agent.Event{Kind: agent.EventKindMessageDelta, Message: "partial response"}
+	close(gateway.started)
+	go func() {
+		defer close(events)
+		<-ctx.Done()
+	}()
+	return events, nil
+}
+
+func (gateway blockingGateway) Stop(_ context.Context, _ string) error {
+	return nil
 }
 
 func (gateway scriptedGateway) Start(_ context.Context, _ agent.StartRequest) (agent.Session, error) {
@@ -647,9 +842,15 @@ func executeAfterApproval(t *testing.T, runner *Runner, querySession *session.Qu
 	go func() {
 		executeErrCh <- runner.ExecuteCurrent(context.Background(), querySession)
 	}()
-	request := <-runner.ApprovalRequests()
-	if resolveErr := runner.ResolveApproval(request.ID, true); resolveErr != nil {
-		t.Fatalf("failed to approve execution: %v", resolveErr)
+	needsInteractiveApproval := true
+	if currentCandidate := querySession.CurrentCandidate(); currentCandidate != nil {
+		needsInteractiveApproval = !approval.IsReadOnlyBYDBQL(currentCandidate.Query)
+	}
+	if needsInteractiveApproval {
+		request := <-runner.ApprovalRequests()
+		if resolveErr := runner.ResolveApproval(request.ID, true); resolveErr != nil {
+			t.Fatalf("failed to approve execution: %v", resolveErr)
+		}
 	}
 	return <-executeErrCh
 }
@@ -674,7 +875,7 @@ func (executor *catalogExecutor) Execute(_ context.Context, _ *session.QuerySess
 	return executor.result, nil
 }
 
-func TestCompleteAgentTurnUsesFallbackWhenAgentSkipsPlanProposal(t *testing.T) {
+func TestCompleteAgentTurnKeepsClarificationWithoutCandidate(t *testing.T) {
 	runner := NewRunner(Config{
 		Validator: &sequenceValidator{reports: []session.ValidationReport{{Valid: true, Message: "valid", QueryType: "TOPN"}}},
 	})
@@ -696,21 +897,22 @@ func TestCompleteAgentTurnUsesFallbackWhenAgentSkipsPlanProposal(t *testing.T) {
 		},
 	}
 	completeErr := runner.completeAgentTurn(context.Background(), querySession, "", []agent.Event{
-		{Kind: agent.EventKindFinalResponse, Message: "schema confirmed"},
+		{Kind: agent.EventKindClarification, Message: "Which service group should I use?"},
 	})
 	if completeErr != nil {
 		t.Fatalf("completeAgentTurn returned error: %v", completeErr)
 	}
-	candidate := querySession.CurrentCandidate()
-	if candidate == nil {
-		t.Fatal("expected fallback candidate")
+	if querySession.CurrentCandidate() != nil {
+		t.Fatalf("unexpected candidate: %+v", querySession.CurrentCandidate())
 	}
-	want := "SHOW TOP 10 FROM MEASURE service_endpoint_latency IN sw_metrics TIME > '-30m' AGGREGATE BY MEAN ORDER BY DESC"
-	if candidate.Query != want {
-		t.Fatalf("unexpected fallback query:\nwant: %s\n got: %s", want, candidate.Query)
+	if querySession.Phase != session.PhaseClarifying {
+		t.Fatalf("expected clarification phase, got %s", querySession.Phase)
 	}
-	if querySession.Phase != session.PhaseReady {
-		t.Fatalf("expected ready phase, got %s", querySession.Phase)
+	if len(querySession.Conversation) != 1 || querySession.Conversation[0].Response != "Which service group should I use?" {
+		t.Fatalf("expected clarification conversation, got %+v", querySession.Conversation)
+	}
+	if len(querySession.ChatMessages) != 1 || querySession.ChatMessages[0].Role != session.ChatRoleAssistant {
+		t.Fatalf("expected assistant clarification message, got %+v", querySession.ChatMessages)
 	}
 }
 

@@ -709,7 +709,7 @@ func isControlledToolPermission(params map[string]any) bool {
 
 func isControlledToolName(raw string) bool {
 	switch normalizeControlledToolName(raw) {
-	case "list_groups_schemas", "describe_schema", "propose_query_plan", "validate_bydbql", "execute_bydbql":
+	case "list_groups_schemas", "describe_schema", "propose_query_plan", "validate_bydbql", "probe_bydbql", "execute_bydbql":
 		return true
 	default:
 		return false

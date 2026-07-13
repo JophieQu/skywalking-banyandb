@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -32,7 +33,6 @@ import (
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/approval"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bridge"
 	tuibysql "github.com/apache/skywalking-banyandb/bydbctl/internal/tui/bydbql"
-	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/planner"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/session"
 	"github.com/apache/skywalking-banyandb/bydbctl/internal/tui/tools"
 )
@@ -82,6 +82,8 @@ var fragmentedTokenReplacements = []struct {
 	{old: "text 10 text", new: "10"},
 	{old: "text 100 text", new: "100"},
 	{old: "text SELECT", new: "SELECT"},
+	{old: "sche mas", new: "schemas"},
+	{old: "sche ma", new: "schema"},
 }
 
 // Validator validates a BYDBQL candidate.
@@ -132,6 +134,20 @@ func NewRunner(config Config) *Runner {
 	}
 }
 
+// SetExecutionPolicy stores the execution policy on the runner approval controller and tool bridge.
+func (runner *Runner) SetExecutionPolicy(policy approval.ExecutionPolicy) {
+	if runner == nil {
+		return
+	}
+	normalizedPolicy := approval.NormalizeExecutionPolicy(string(policy))
+	if runner.approvals != nil {
+		runner.approvals.SetPolicy(normalizedPolicy)
+	}
+	if runner.toolBridge != nil {
+		runner.toolBridge.SetExecutionPolicy(normalizedPolicy)
+	}
+}
+
 // ApprovalRequests returns execution approvals that require a user decision.
 func (runner *Runner) ApprovalRequests() <-chan approval.Request {
 	return runner.approvals.Requests()
@@ -157,14 +173,15 @@ type TurnUpdate struct {
 
 // StartOptions contains user-provided session slots.
 type StartOptions struct {
-	ResourceType   session.ResourceType
-	TimeRange      session.TimeRange
-	Goal           string
-	ResourceName   string
-	Groups         []string
-	NameProvided   bool
-	GroupsProvided bool
-	TypeProvided   bool
+	ResourceType    session.ResourceType
+	TimeRange       session.TimeRange
+	Goal            string
+	ResourceName    string
+	Groups          []string
+	ExecutionPolicy approval.ExecutionPolicy
+	NameProvided    bool
+	GroupsProvided  bool
+	TypeProvided    bool
 }
 
 // StartSession creates a session and discovers a schema summary.
@@ -188,16 +205,17 @@ func (runner *Runner) StartSession(ctx context.Context, options StartOptions) (*
 	schemaSnapshot.AvailableGroups = append([]string(nil), catalog.Groups...)
 	schemaSnapshot.Catalog = append([]session.CatalogEntry(nil), catalog.Entries...)
 	querySession := &session.QuerySession{
-		ID:             uuid.NewString(),
-		Phase:          session.PhaseIntent,
-		UserGoal:       resolved.Goal,
-		ResourceType:   resolved.ResourceType,
-		ResourceName:   resolved.ResourceName,
-		Groups:         append([]string(nil), resolved.Groups...),
-		TimeRange:      resolved.TimeRange,
-		SchemaSnapshot: schemaSnapshot,
-		SlotsPinned:    resolved.SlotsPinned,
-		AutoMatched:    resolved.AutoMatched,
+		ID:              uuid.NewString(),
+		Phase:           session.PhaseIntent,
+		UserGoal:        resolved.Goal,
+		ResourceType:    resolved.ResourceType,
+		ResourceName:    resolved.ResourceName,
+		Groups:          append([]string(nil), resolved.Groups...),
+		TimeRange:       resolved.TimeRange,
+		SchemaSnapshot:  schemaSnapshot,
+		SlotsPinned:     resolved.SlotsPinned,
+		AutoMatched:     resolved.AutoMatched,
+		ExecutionPolicy: approval.NormalizeExecutionPolicy(string(options.ExecutionPolicy)),
 	}
 	querySession.AddTranscript("workflow", "created BYDBQL agent session", runner.now())
 	if resolved.AutoMatched {
@@ -264,11 +282,12 @@ func (runner *Runner) SyncSession(ctx context.Context, querySession *session.Que
 
 func newAutonomousSession(options StartOptions, catalog session.SchemaCatalog, now time.Time) *session.QuerySession {
 	querySession := &session.QuerySession{
-		ID:          uuid.NewString(),
-		Phase:       session.PhaseIntent,
-		UserGoal:    strings.TrimSpace(options.Goal),
-		TimeRange:   applyTimeDefaults(options.TimeRange),
-		AutoMatched: false,
+		ID:              uuid.NewString(),
+		Phase:           session.PhaseIntent,
+		UserGoal:        strings.TrimSpace(options.Goal),
+		TimeRange:       applyTimeDefaults(options.TimeRange),
+		AutoMatched:     false,
+		ExecutionPolicy: approval.NormalizeExecutionPolicy(string(options.ExecutionPolicy)),
 		SchemaSnapshot: session.SchemaSnapshot{
 			UpdatedAt:       catalog.UpdatedAt,
 			AvailableGroups: append([]string(nil), catalog.Groups...),
@@ -352,14 +371,18 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 		return nil, errors.New("agent gateway is not configured")
 	}
 	if runner.toolBridge != nil {
-		runner.toolBridge.SetSession(querySession)
+		runner.toolBridge.SetExecutionPolicy(querySession.ExecutionPolicy)
 	}
-	if bootstrapErr := runner.bootstrapAutonomousSchema(ctx, querySession); bootstrapErr != nil {
+	if bootstrapErr := runner.refreshDiscoveryForTurn(ctx, querySession, strings.TrimSpace(turnHint)); bootstrapErr != nil {
 		querySession.AddTranscript("workflow", "schema bootstrap: "+bootstrapErr.Error(), runner.now())
 	}
-	rankedCatalog := RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
+	trimmedTurnHint := strings.TrimSpace(turnHint)
+	rankingGoal := CatalogRankingGoal(querySession.UserGoal, trimmedTurnHint)
+	querySession.DiscoveryGoal = rankingGoal
+	rankedCatalog := RankCatalogCandidates(rankingGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
 	if runner.toolBridge != nil {
-		runner.toolBridge.SetRankedCandidates(RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, 5))
+		runner.toolBridge.SetSession(querySession)
+		runner.toolBridge.SetRankedCandidates(RankCatalogCandidates(rankingGoal, querySession.SchemaSnapshot.Catalog, 5))
 	}
 	querySession.Phase = session.PhaseAgentDraft
 	agentSessionID := strings.TrimSpace(querySession.AgentSessionID)
@@ -377,9 +400,16 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 		agentSessionID = agentSession.ID
 		querySession.AgentSessionID = agentSessionID
 	}
-	trimmedTurnHint := strings.TrimSpace(turnHint)
 	if trimmedTurnHint != "" {
 		querySession.AddTranscript("user", trimmedTurnHint, runner.now())
+		querySession.AddChatMessage(session.ChatMessage{
+			Role:      session.ChatRoleUser,
+			Content:   trimmedTurnHint,
+			CreatedAt: runner.now(),
+		})
+		if strings.TrimSpace(querySession.UserGoal) == "" {
+			querySession.UserGoal = trimmedTurnHint
+		}
 	}
 	templateHint := ""
 	if strings.TrimSpace(querySession.ResourceName) != "" {
@@ -391,7 +421,7 @@ func (runner *Runner) StartAgentTurn(ctx context.Context, querySession *session.
 		)
 	}
 	hints := ClassifyIntent(querySession)
-	rankedCatalog = RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
+	rankedCatalog = RankCatalogCandidates(rankingGoal, querySession.SchemaSnapshot.Catalog, maxPromptCatalogCandidates)
 	payload := agent.BuildAgentTurnRequest(querySession, hints, templateHint, trimmedTurnHint)
 	payload.Schema.CatalogTotal = len(querySession.SchemaSnapshot.Catalog)
 	if len(rankedCatalog) > 0 {
@@ -426,7 +456,82 @@ func (runner *Runner) StopAgentTurn(ctx context.Context, querySession *session.Q
 	return nil
 }
 
-func (runner *Runner) bootstrapAutonomousSchema(ctx context.Context, querySession *session.QuerySession) error {
+func (runner *Runner) refreshDiscoveryForTurn(ctx context.Context, querySession *session.QuerySession, turnHint string) error {
+	if querySession == nil || runner.executor == nil {
+		return nil
+	}
+	if len(querySession.SchemaSnapshot.Catalog) == 0 {
+		return nil
+	}
+	rankingGoal := CatalogRankingGoal(querySession.UserGoal, turnHint)
+	if strings.TrimSpace(turnHint) == "" {
+		return runner.bootstrapAutonomousSchema(ctx, querySession, rankingGoal)
+	}
+	var match catalogMatch
+	if explicitEntry := FindExplicitResourceMention(rankingGoal, querySession.SchemaSnapshot.Catalog); explicitEntry != nil {
+		match = catalogMatch{
+			Matched: true,
+			Group:   explicitEntry.Group,
+			Name:    explicitEntry.Name,
+			Type:    explicitEntry.Type,
+			Score:   100,
+		}
+	} else {
+		match = matchResourceFromGoal(
+			rankingGoal,
+			session.SchemaCatalog{Entries: querySession.SchemaSnapshot.Catalog},
+			"",
+			"",
+			nil,
+		)
+	}
+	if !match.Matched {
+		return nil
+	}
+	currentName := strings.TrimSpace(querySession.ResourceName)
+	currentGroup := ""
+	if len(querySession.Groups) > 0 {
+		currentGroup = querySession.Groups[0]
+	}
+	if currentName != "" &&
+		strings.EqualFold(currentName, match.Name) &&
+		(currentGroup == "" || strings.EqualFold(currentGroup, match.Group)) {
+		return nil
+	}
+	schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
+		Type:   match.Type,
+		Name:   match.Name,
+		Groups: []string{match.Group},
+	})
+	if schemaErr != nil {
+		return fmt.Errorf("failed to refresh matched schema: %w", schemaErr)
+	}
+	schemaSnapshot.AvailableGroups = append([]string(nil), querySession.SchemaSnapshot.AvailableGroups...)
+	schemaSnapshot.Catalog = append([]session.CatalogEntry(nil), querySession.SchemaSnapshot.Catalog...)
+	querySession.ResourceType = match.Type
+	querySession.ResourceName = match.Name
+	querySession.Groups = []string{match.Group}
+	querySession.SchemaSnapshot = schemaSnapshot
+	querySession.AutoMatched = true
+	querySession.CandidateSuperseded = true
+	querySession.Validation = session.ValidationReport{}
+	querySession.AddTranscript(
+		"workflow",
+		fmt.Sprintf("re-matched resource %s %s in %s from turn hint", match.Type, match.Name, match.Group),
+		runner.now(),
+	)
+	if runner.toolBridge != nil {
+		runner.toolBridge.SetSession(querySession)
+		runner.toolBridge.SetRankedCandidates(EnsureCatalogEntry(
+			RankCatalogCandidates(rankingGoal, querySession.SchemaSnapshot.Catalog, 5),
+			session.CatalogEntry{Group: match.Group, Type: match.Type, Name: match.Name},
+			5,
+		))
+	}
+	return nil
+}
+
+func (runner *Runner) bootstrapAutonomousSchema(ctx context.Context, querySession *session.QuerySession, rankingGoal string) error {
 	if querySession == nil || runner.executor == nil {
 		return nil
 	}
@@ -436,8 +541,11 @@ func (runner *Runner) bootstrapAutonomousSchema(ctx context.Context, querySessio
 	if len(querySession.SchemaSnapshot.Catalog) == 0 {
 		return nil
 	}
+	if strings.TrimSpace(rankingGoal) == "" {
+		rankingGoal = strings.TrimSpace(querySession.UserGoal)
+	}
 	match := matchResourceFromGoal(
-		querySession.UserGoal,
+		rankingGoal,
 		session.SchemaCatalog{Entries: querySession.SchemaSnapshot.Catalog},
 		"",
 		"",
@@ -470,7 +578,7 @@ func (runner *Runner) bootstrapAutonomousSchema(ctx context.Context, querySessio
 		runner.toolBridge.SetSession(querySession)
 		matchedEntry := session.CatalogEntry{Group: match.Group, Type: match.Type, Name: match.Name}
 		runner.toolBridge.SetRankedCandidates(EnsureCatalogEntry(
-			RankCatalogCandidates(querySession.UserGoal, querySession.SchemaSnapshot.Catalog, 5),
+			RankCatalogCandidates(rankingGoal, querySession.SchemaSnapshot.Catalog, 5),
 			matchedEntry,
 			5,
 		))
@@ -491,10 +599,6 @@ func (runner *Runner) streamAgentTurn(
 	for agentEvents != nil {
 		select {
 		case <-ctx.Done():
-			if completeErr := runner.completeAgentTurn(ctx, querySession, turnHint, collectedEvents); completeErr == nil {
-				updates <- TurnUpdate{Done: true, QuerySession: querySession}
-				return
-			}
 			querySession.Phase = session.PhaseReady
 			updates <- TurnUpdate{Done: true, Err: ctx.Err(), QuerySession: querySession}
 			return
@@ -509,6 +613,7 @@ func (runner *Runner) streamAgentTurn(
 				updates <- TurnUpdate{Event: &event, QuerySession: querySession}
 			}
 			if event.Kind == agent.EventKindError {
+				runner.syncToolBridgeSession(querySession)
 				querySession.Phase = session.PhaseError
 				errorValue := event.Err
 				if errorValue == nil {
@@ -524,8 +629,27 @@ func (runner *Runner) streamAgentTurn(
 			}
 		}
 	}
+	runner.syncToolBridgeSession(querySession)
 	completeErr := runner.completeAgentTurn(ctx, querySession, turnHint, collectedEvents)
 	updates <- TurnUpdate{Done: true, Err: completeErr, QuerySession: querySession}
+}
+
+func (runner *Runner) syncToolBridgeSession(querySession *session.QuerySession) {
+	if runner.toolBridge == nil || querySession == nil {
+		return
+	}
+	bridgeSession := runner.toolBridge.SessionSnapshot()
+	if bridgeSession == nil {
+		return
+	}
+	querySession.ResourceType = bridgeSession.ResourceType
+	querySession.ResourceName = bridgeSession.ResourceName
+	querySession.Groups = append([]string(nil), bridgeSession.Groups...)
+	querySession.SchemaSnapshot = bridgeSession.SchemaSnapshot
+	querySession.PlannedQueries = append([]session.PlannedQuery(nil), bridgeSession.PlannedQueries...)
+	querySession.ActivePlanStep = bridgeSession.ActivePlanStep
+	querySession.ExecutionResult = bridgeSession.ExecutionResult
+	querySession.SetPendingProbe(bridgeSession.PendingProbe)
 }
 
 func drainBridgeEvents(
@@ -563,32 +687,29 @@ func shouldForwardAgentTurnEvent(event agent.Event) bool {
 
 func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *session.QuerySession, turnHint string, turnEvents []agent.Event) error {
 	candidate := finalCandidate(turnEvents)
-	fallbackExplanation := ""
 	if strings.TrimSpace(candidate) == "" {
-		fallbackCandidate, explanation, fallbackErr := runner.compileFallbackCandidate(ctx, querySession)
-		if fallbackErr == nil && strings.TrimSpace(fallbackCandidate) != "" {
-			candidate = fallbackCandidate
-			fallbackExplanation = explanation
-			querySession.AddTranscript("workflow", "compiled fallback query plan from goal and preloaded schema", runner.now())
+		if containsUncontrolledBydbql(turnEvents) {
+			querySession.Phase = session.PhaseValidate
+			return errors.New("agent embedded BYDBQL outside the controlled query plan tool")
 		}
-	}
-	if strings.TrimSpace(candidate) == "" {
-		querySession.Phase = session.PhaseValidate
-		outputSummary := truncateDiagnostic(agentOutputSummary(turnEvents))
-		if outputSummary == "" {
+		response := finalClarification(turnEvents)
+		phase := session.PhaseClarifying
+		if response == "" {
+			response = strings.TrimSpace(agentOutputText(turnEvents))
+			phase = session.PhaseConversation
+		}
+		if response == "" {
 			return errors.New("agent returned no structured BYDBQL candidate and no readable output")
 		}
-		return fmt.Errorf("agent returned no structured BYDBQL candidate; agent output: %s", outputSummary)
+		runner.recordConversation(querySession, turnHint, response, phase)
+		return nil
 	}
 	validation, validationErr := runner.validator.Validate(ctx, candidate, &querySession.SchemaSnapshot)
 	if validationErr != nil {
 		querySession.Phase = session.PhaseError
 		return fmt.Errorf("failed to validate agent candidate: %w", validationErr)
 	}
-	explanation := finalExplanation(turnEvents)
-	if fallbackExplanation != "" {
-		explanation = fallbackExplanation
-	}
+	explanation := NormalizeAgentDisplayText(finalExplanation(turnEvents))
 	querySession.AddCandidate(session.BydbqlCandidate{
 		ID:          fmt.Sprintf("candidate-%d", len(querySession.Candidates)+1),
 		Query:       candidate,
@@ -596,6 +717,7 @@ func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *sessi
 		Source:      session.CandidateSourceAgent,
 		CreatedAt:   runner.now(),
 		Validation:  validation,
+		Probe:       querySession.TakePendingProbe(),
 	})
 	querySession.AddConversationTurn(session.ConversationTurn{
 		Hint:      turnHint,
@@ -603,6 +725,17 @@ func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *sessi
 		Candidate: candidate,
 		CreatedAt: runner.now(),
 	})
+	assistantMessage := session.ChatMessage{
+		Role:      session.ChatRoleAssistant,
+		Content:   explanation,
+		Candidate: candidate,
+		CreatedAt: runner.now(),
+	}
+	if validation.Message != "" || validation.Valid {
+		copiedValidation := validation
+		assistantMessage.Validation = &copiedValidation
+	}
+	querySession.AddChatMessage(assistantMessage)
 	querySession.AddTranscript("agent", explanation, runner.now())
 	if validation.Valid {
 		querySession.Phase = session.PhaseReady
@@ -610,6 +743,22 @@ func (runner *Runner) completeAgentTurn(ctx context.Context, querySession *sessi
 	}
 	querySession.Phase = session.PhaseValidate
 	return nil
+}
+
+func (runner *Runner) recordConversation(querySession *session.QuerySession, turnHint, response string, phase session.Phase) {
+	displayResponse := NormalizeAgentDisplayText(response)
+	querySession.Phase = phase
+	querySession.AddConversationTurn(session.ConversationTurn{
+		Hint:      turnHint,
+		Response:  displayResponse,
+		CreatedAt: runner.now(),
+	})
+	querySession.AddChatMessage(session.ChatMessage{
+		Role:      session.ChatRoleAssistant,
+		Content:   displayResponse,
+		CreatedAt: runner.now(),
+	})
+	querySession.AddTranscript("agent", displayResponse, runner.now())
 }
 
 // ValidateManualQuery validates an edited BYDBQL query and records it as a manual candidate.
@@ -657,6 +806,21 @@ func (runner *Runner) ExecuteCurrent(ctx context.Context, querySession *session.
 	if plannedQuery != nil && plannedQuery.Query != query {
 		querySession.Phase = session.PhaseValidate
 		return errors.New("only the current compiled workflow statement can be executed")
+	}
+	if plannedQuery != nil && runner.executor != nil {
+		schemaSnapshot, schemaErr := runner.executor.DiscoverSchema(ctx, tools.SchemaRequest{
+			Type:   plannedQuery.ResourceType,
+			Name:   plannedQuery.Name,
+			Groups: plannedQuery.Groups,
+		})
+		if schemaErr != nil {
+			querySession.Phase = session.PhaseError
+			return fmt.Errorf("failed to refresh schema before execution: %w", schemaErr)
+		}
+		querySession.SchemaSnapshot = schemaSnapshot
+		querySession.ResourceType = plannedQuery.ResourceType
+		querySession.ResourceName = plannedQuery.Name
+		querySession.Groups = append([]string(nil), plannedQuery.Groups...)
 	}
 	decision, approvalErr := runner.approvals.Request(ctx, runner.executionApproval(querySession, query, approval.SourceManual))
 	if approvalErr != nil {
@@ -780,10 +944,10 @@ func buildStructuredPlanExample(querySession *session.QuerySession, hints agent.
 		"groups": groups,
 	}
 	planExample := map[string]any{
-		"resource":    resource,
-		"time_range":  map[string]any{"start": timeStart},
-		"order_by":    map[string]any{"direction": "DESC"},
-		"aggregate":   map[string]any{"function": "MEAN"},
+		"resource":   resource,
+		"time_range": map[string]any{"start": timeStart},
+		"order_by":   map[string]any{"direction": "DESC"},
+		"aggregate":  map[string]any{"function": "MEAN"},
 	}
 	if hints.PreferShowTop || querySession.ResourceType == session.ResourceTypeTopN {
 		resource["type"] = session.ResourceTypeTopN.String()
@@ -801,77 +965,6 @@ func buildStructuredPlanExample(querySession *session.QuerySession, hints agent.
 	}
 	planExample["limit"] = limit
 	return map[string]any{"plan": planExample}
-}
-
-func (runner *Runner) compileFallbackCandidate(ctx context.Context, querySession *session.QuerySession) (string, string, error) {
-	if querySession == nil || !querySession.SchemaSnapshot.Loaded {
-		return "", "", errors.New("preloaded schema is required for fallback compilation")
-	}
-	hints := ClassifyIntent(querySession)
-	plan, ok := buildFallbackQueryPlan(querySession, hints)
-	if !ok {
-		return "", "", errors.New("unable to derive a fallback query plan from the session")
-	}
-	compiled, compileErr := planner.Compile(plan, querySession.SchemaSnapshot)
-	if compileErr != nil {
-		return "", "", fmt.Errorf("failed to compile fallback query plan: %w", compileErr)
-	}
-	validation, validationErr := runner.validator.Validate(ctx, compiled.Query, &querySession.SchemaSnapshot)
-	if validationErr != nil {
-		return "", "", fmt.Errorf("failed to validate fallback query plan: %w", validationErr)
-	}
-	if !validation.Valid {
-		return "", "", fmt.Errorf("fallback query plan is invalid: %s", validation.Message)
-	}
-	explanation := fmt.Sprintf(
-		"Auto-compiled %s query on %s in %s from goal",
-		strings.ToUpper(plan.Resource.Type.String()),
-		plan.Resource.Name,
-		strings.Join(plan.Resource.Groups, ", "),
-	)
-	return compiled.Query, explanation, nil
-}
-
-func buildFallbackQueryPlan(querySession *session.QuerySession, hints agent.QueryHints) (planner.QueryPlan, bool) {
-	resourceName := strings.TrimSpace(querySession.ResourceName)
-	groups := normalizeGroups(querySession.Groups)
-	if resourceName == "" || len(groups) == 0 {
-		return planner.QueryPlan{}, false
-	}
-	timeStart := strings.TrimSpace(hints.TimeRangeHint)
-	if timeStart == "" {
-		timeStart = strings.TrimSpace(querySession.TimeRange.Start)
-	}
-	if timeStart == "" {
-		timeStart = defaultTimeStart
-	}
-	plan := planner.QueryPlan{
-		TimeRange: planner.TimeRange{Start: timeStart},
-	}
-	if hints.PreferShowTop || querySession.ResourceType == session.ResourceTypeTopN {
-		plan.Resource = planner.Resource{
-			Type:   session.ResourceTypeTopN,
-			Name:   resourceName,
-			Groups: groups,
-		}
-		plan.TopN = hints.LimitHint
-		if plan.TopN <= 0 {
-			plan.TopN = defaultTopN
-		}
-		plan.Aggregate = &planner.Aggregate{Function: planner.AggregateMean}
-		plan.OrderBy = &planner.Order{Direction: planner.OrderDescending}
-		return plan, true
-	}
-	plan.Resource = planner.Resource{
-		Type:   querySession.ResourceType,
-		Name:   resourceName,
-		Groups: groups,
-	}
-	plan.Limit = hints.LimitHint
-	if plan.Limit <= 0 {
-		plan.Limit = defaultLimit
-	}
-	return plan, true
 }
 
 // BuildTemplateQuery creates the deterministic starter query for a resource.
@@ -893,7 +986,7 @@ func BuildTemplateQuery(resourceType session.ResourceType, resourceName string, 
 }
 
 func (runner *Runner) sendAgentTurn(ctx context.Context, agentSessionID string, payload agent.RequestPayload) (<-chan agent.Event, error) {
-	taskPrompt := "Discover the relevant schema and submit a typed query plan from the goal and context JSON."
+	taskPrompt := "Continue the conversation using the goal and context JSON. Discover schemas when useful, and submit a typed query plan only when the user request is ready."
 	if strings.TrimSpace(payload.Candidate) != "" {
 		taskPrompt = "Revise the typed query plan using validation or execution feedback in the context JSON."
 	}
@@ -969,17 +1062,17 @@ func finalCandidate(events []agent.Event) string {
 func agentOutputText(events []agent.Event) string {
 	for eventIdx := len(events) - 1; eventIdx >= 0; eventIdx-- {
 		event := events[eventIdx]
-		if event.Kind == agent.EventKindFinalResponse && strings.TrimSpace(event.Message) != "" {
-			return event.Message
+		if event.Origin != agent.EventOriginToolBridge && event.Kind == agent.EventKindFinalResponse && strings.TrimSpace(event.Message) != "" {
+			return NormalizeAgentDisplayText(event.Message)
 		}
 	}
 	var messages []string
 	for _, event := range events {
-		if event.Kind == agent.EventKindPlanUpdate {
+		if event.Origin == agent.EventOriginToolBridge || event.Kind == agent.EventKindPlanUpdate {
 			continue
 		}
 		if strings.TrimSpace(event.Message) != "" {
-			messages = append(messages, event.Message)
+			messages = append(messages, NormalizeAgentDisplayText(event.Message))
 		}
 	}
 	return strings.Join(messages, "\n")
@@ -988,6 +1081,9 @@ func agentOutputText(events []agent.Event) string {
 func finalExplanation(events []agent.Event) string {
 	for eventIdx := len(events) - 1; eventIdx >= 0; eventIdx-- {
 		event := events[eventIdx]
+		if event.Origin == agent.EventOriginToolBridge {
+			continue
+		}
 		if strings.TrimSpace(event.Explanation) != "" {
 			return strings.TrimSpace(event.Explanation)
 		}
@@ -998,9 +1094,42 @@ func finalExplanation(events []agent.Event) string {
 	return "agent returned a BYDBQL candidate"
 }
 
+func finalClarification(events []agent.Event) string {
+	for eventIdx := len(events) - 1; eventIdx >= 0; eventIdx-- {
+		event := events[eventIdx]
+		if event.Kind == agent.EventKindClarification && strings.TrimSpace(event.Message) != "" {
+			return strings.TrimSpace(event.Message)
+		}
+	}
+	return ""
+}
+
+func containsUncontrolledBydbql(events []agent.Event) bool {
+	var outputParts []string
+	for _, event := range events {
+		outputParts = append(outputParts, event.Candidate, event.Message, event.Explanation)
+	}
+	normalizedText := strings.ToUpper(RepairFragmentedQuery(strings.Join(outputParts, " ")))
+	if strings.Contains(normalizedText, "SHOW TOP ") && strings.Contains(normalizedText, " FROM MEASURE ") {
+		return true
+	}
+	if !strings.Contains(normalizedText, "SELECT ") {
+		return false
+	}
+	for _, resourceType := range []string{"MEASURE", "STREAM", "TRACE", "PROPERTY"} {
+		if strings.Contains(normalizedText, " FROM "+resourceType+" ") {
+			return true
+		}
+	}
+	return false
+}
+
 func agentOutputSummary(events []agent.Event) string {
 	var outputParts []string
 	for _, event := range events {
+		if event.Origin == agent.EventOriginToolBridge {
+			continue
+		}
 		if strings.TrimSpace(event.Candidate) != "" {
 			outputParts = append(outputParts, "candidate="+singleLine(event.Candidate))
 		}
@@ -1024,6 +1153,118 @@ func truncateDiagnostic(value string) string {
 
 func singleLine(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+// NormalizeAgentDisplayText repairs ACP fragmented natural-language output for UI display.
+func NormalizeAgentDisplayText(text string) string {
+	normalizedText := singleLine(text)
+	if normalizedText == "" {
+		return strings.TrimSpace(text)
+	}
+	if !strings.Contains(normalizedText, "`") {
+		return normalizePlainAgentText(normalizedText)
+	}
+	var builder strings.Builder
+	segmentStart := 0
+	for segmentStart < len(normalizedText) {
+		backtickStart := strings.Index(normalizedText[segmentStart:], "`")
+		if backtickStart < 0 {
+			builder.WriteString(normalizePlainAgentText(normalizedText[segmentStart:]))
+			break
+		}
+		backtickStart += segmentStart
+		builder.WriteString(normalizePlainAgentText(normalizedText[segmentStart:backtickStart]))
+		backtickEnd := strings.Index(normalizedText[backtickStart+1:], "`")
+		if backtickEnd < 0 {
+			builder.WriteString(normalizeFragmentedAgentText(normalizedText[backtickStart:]))
+			break
+		}
+		backtickEnd += backtickStart + 1
+		innerText := strings.TrimSpace(normalizedText[backtickStart+1 : backtickEnd])
+		builder.WriteString("`")
+		builder.WriteString(normalizeFragmentedAgentText(innerText))
+		builder.WriteString("`")
+		segmentStart = backtickEnd + 1
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func normalizePlainAgentText(text string) string {
+	if text == "" {
+		return text
+	}
+	plainText := collapseCJKSpacing(text)
+	plainText = collapseContractionSpacing(plainText)
+	plainText = strings.ReplaceAll(plainText, " ,", ",")
+	plainText = strings.ReplaceAll(plainText, " .", ".")
+	plainText = strings.ReplaceAll(plainText, "( ", "(")
+	plainText = strings.ReplaceAll(plainText, " )", ")")
+	plainText = strings.ReplaceAll(plainText, " - ", "-")
+	plainText = strings.ReplaceAll(plainText, " -", "-")
+	plainText = strings.ReplaceAll(plainText, "- ", "-")
+	if strings.Contains(plainText, "_") {
+		return normalizeFragmentedAgentText(plainText)
+	}
+	plainText = collapseIdentifierFragments(plainText)
+	for _, replacement := range fragmentedTokenReplacements {
+		if strings.Contains(plainText, replacement.old) {
+			plainText = strings.ReplaceAll(plainText, replacement.old, replacement.new)
+		}
+	}
+	return plainText
+}
+
+func collapseContractionSpacing(text string) string {
+	replacements := []string{
+		" n't", "n't",
+		" 't ", "'t ",
+		" 's ", "'s ",
+		" 're ", "'re ",
+		" 've ", "'ve ",
+		" 'd ", "'d ",
+		" 'll ", "'ll ",
+	}
+	for idx := 0; idx < len(replacements); idx += 2 {
+		text = strings.ReplaceAll(text, replacements[idx], replacements[idx+1])
+	}
+	return text
+}
+
+func collapseACPTextSpacing(text string) string {
+	return collapseCJKSpacing(text)
+}
+
+func collapseCJKSpacing(text string) string {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return text
+	}
+	var builder strings.Builder
+	builder.Grow(len(runes))
+	for runeIdx := 0; runeIdx < len(runes); runeIdx++ {
+		currentRune := runes[runeIdx]
+		if currentRune == ' ' && runeIdx > 0 && runeIdx+1 < len(runes) && shouldCollapseACPSpacing(runes[runeIdx-1], runes[runeIdx+1]) {
+			continue
+		}
+		builder.WriteRune(currentRune)
+	}
+	return builder.String()
+}
+
+func shouldCollapseACPSpacing(left, right rune) bool {
+	return isACPCompactRune(left) && isACPCompactRune(right)
+}
+
+func isACPCompactRune(value rune) bool {
+	if unicode.Is(unicode.Han, value) {
+		return true
+	}
+	switch value {
+	case '，', '。', '、', '；', '：', '？', '！', '）', '（', '》', '《', '」', '「', '’', '‘', '”', '“':
+		return true
+	default:
+		return false
+	}
 }
 
 // RepairFragmentedQuery normalizes ACP fragmented BYDBQL text into a single statement.
@@ -1077,7 +1318,13 @@ func shouldJoinIdentifierFragment(left, right string) bool {
 	if left == "" || right == "" {
 		return false
 	}
+	if isFragmentJoinStopword(left) || isFragmentJoinStopword(right) {
+		return false
+	}
 	if strings.HasSuffix(left, "_") || strings.HasPrefix(right, "_") {
+		return true
+	}
+	if strings.Contains(left, "_") && len(right) <= 4 && isIdentifierFragment(right) {
 		return true
 	}
 	if len(right) == 1 && isUpperAlpha(right) {
@@ -1086,7 +1333,25 @@ func shouldJoinIdentifierFragment(left, right string) bool {
 			return true
 		}
 	}
-	return isLowerAlpha(left) && isLowerAlpha(right) && len(left) <= 4 && len(right) <= 12
+	return isLowerAlpha(left) && isLowerAlpha(right) && len(left) <= 4 && len(right) <= 12 && len(left)+len(right) <= 8
+}
+
+func isFragmentJoinStopword(token string) bool {
+	_, found := fragmentJoinStopwords[token]
+	return found
+}
+
+var fragmentJoinStopwords = map[string]struct{}{
+	"the": {}, "and": {}, "for": {}, "you": {}, "your": {}, "need": {}, "more": {}, "let": {}, "but": {}, "not": {},
+	"see": {}, "ask": {}, "use": {}, "with": {}, "from": {}, "that": {}, "this": {}, "what": {}, "when": {}, "have": {},
+	"has": {}, "are": {}, "was": {}, "were": {}, "been": {}, "into": {}, "also": {}, "all": {}, "can": {}, "could": {},
+	"would": {}, "should": {}, "will": {}, "after": {}, "before": {}, "about": {}, "than": {}, "then": {}, "them": {},
+	"they": {}, "most": {}, "like": {}, "just": {}, "only": {}, "very": {}, "here": {}, "there": {}, "how": {}, "who": {},
+	"why": {}, "its": {}, "our": {}, "out": {}, "any": {}, "may": {}, "did": {}, "don": {}, "does": {}, "didn": {},
+	"doesn": {}, "isn": {}, "aren": {}, "won": {}, "cant": {}, "couldn": {}, "wouldn": {}, "shouldn": {}, "must": {},
+	"still": {}, "even": {}, "over": {}, "such": {}, "once": {}, "each": {}, "both": {}, "me": {}, "by": {}, "to": {},
+	"in": {}, "on": {}, "at": {}, "or": {}, "if": {}, "as": {}, "an": {}, "be": {}, "we": {}, "he": {}, "it": {},
+	"my": {}, "up": {}, "so": {}, "no": {}, "do": {}, "go": {}, "is": {}, "am": {},
 }
 
 func isUpperAlpha(value string) bool {
@@ -1101,6 +1366,18 @@ func isUpperAlpha(value string) bool {
 func isLowerAlpha(value string) bool {
 	for _, valueRune := range value {
 		if valueRune < 'a' || valueRune > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func isIdentifierFragment(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, valueRune := range value {
+		if (valueRune < 'a' || valueRune > 'z') && valueRune != '_' {
 			return false
 		}
 	}
